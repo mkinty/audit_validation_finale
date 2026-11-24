@@ -1,0 +1,17 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Données locales de l'outil
+config_audit_vf.json
+ids_en_attente.json
+*.tmp
+.pytest_cache/
+rapport_validation_finale_*.html
