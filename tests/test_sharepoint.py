@@ -7,7 +7,7 @@ import time
 import pytest
 from openpyxl import load_workbook
 
-from avf.models.source import EXCEL, LOCAL, WEBDAV, SourceAudit
+from avf.models.source import EXCEL, LOCAL, URL as URL_MODE, WEBDAV, SourceAudit
 from avf.services import sharepoint as sp
 from avf.services.audit import auditer_communes
 from avf.services.mise_a_jour import (
@@ -108,8 +108,21 @@ def test_repli_sur_la_bibliotheque_synchronisee(tmp_path):
     local.mkdir(parents=True)
     montages = [(str(tmp_path / "SNA - Documents"), "https://contoso.sharepoint.com/sites/SNA/Shared Documents")]
     source = sp.connecter(URL, montages=montages, est_dossier=lambda c: c != WEBDAV_RACINE and os.path.isdir(c))
-    assert source == SourceAudit(EXCEL, str(local), URL)
-    assert source.sharepoint and "via Excel" in source.libelle
+    assert (source.mode, source.racine, source.lien) == (EXCEL, str(local), URL)
+    assert source.sharepoint and source.listable and "bibliothèque synchronisée" in source.libelle
+
+
+def test_repli_sur_l_ouverture_par_adresse(tmp_path):
+    """Ni WebDAV ni synchronisation (cas réel : erreur 224) : fichiers ouverts par adresse via Excel."""
+    def refuse(chemin):
+        raise OSError(22, "Accès refusé. Avant d'ouvrir des fichiers de cet emplacement, vous devez "
+                          "d'abord ajouter le site Web à votre liste de sites approuvés")
+
+    source = sp.connecter(URL, montages=[], est_dossier=refuse, excel_present=lambda: True)
+    assert (source.mode, source.racine, source.lien) == (URL_MODE, URL, URL)
+    assert not source.listable and "sans synchronisation" in source.libelle
+    assert "erreur 224" in source.diagnostic and "Afficher dans l'Explorateur" in source.diagnostic
+    assert source.url_fichier("2a004") == URL + "/Dep2A/2A004/audit_2A004.xlsx"
 
 
 def test_webdav_trop_lent_ne_bloque_pas(tmp_path):
@@ -119,8 +132,8 @@ def test_webdav_trop_lent_ne_bloque_pas(tmp_path):
         return os.path.isdir(chemin)
 
     debut = time.monotonic()
-    with pytest.raises(sp.AccesImpossible, match="délai dépassé"):
-        sp.connecter(URL, delai_s=0.3, montages=[], est_dossier=lent)
+    with pytest.raises(sp.AccesImpossible, match="n'a pas répondu à temps"):
+        sp.connecter(URL, delai_s=0.3, montages=[], est_dossier=lent, excel_present=lambda: False)
     assert time.monotonic() - debut < 2
 
 
@@ -129,10 +142,18 @@ def test_aucun_acces_explique_la_marche_a_suivre():
         raise PermissionError(13, "Accès refusé")
 
     with pytest.raises(sp.AccesImpossible) as erreur:
-        sp.connecter(URL, montages=[], est_dossier=refuse)
+        sp.connecter(URL, montages=[], est_dossier=refuse, excel_present=lambda: False)
     texte = str(erreur.value)
     assert "Accès refusé" in texte and WEBDAV_RACINE in texte
-    assert "Rester connecté" in texte and "WebClient" in texte and "synchronisez" in texte
+    assert "Afficher dans l'Explorateur" in texte and "Synchroniser" in texte and "Excel" in texte
+
+
+def test_cause_reelle_du_refus_webdav_remontee():
+    """``os.path.isdir`` taisait la cause : la liste du dossier la donne."""
+    with pytest.raises(OSError):
+        sp._dossier_accessible(os.path.join(os.getcwd(), "dossier_qui_n_existe_pas"))
+    assert sp._cause_webdav("delai").startswith("le serveur n'a pas répondu")
+    assert sp._cause_webdav(None) == "accès refusé ou dossier introuvable"
 
 
 # ── Audit depuis SharePoint ───────────────────────────────────────
@@ -273,3 +294,51 @@ def test_copier_version_serveur_excel_reel(racine, tmp_path):
         return [(l.ligne, l.id_erreur, l.audit, l.date_audit, l.auditeur, l.validation)
                 for l in lire_audit(chemin, "ID erreur", ColonnesAudit()).lignes]
     assert lu(copie) == lu(original)
+
+
+# ── Mode « via Excel, sans synchronisation » (ouverture par adresse) ─
+def test_audit_par_adresse_lit_le_serveur(racine, serveur_divergent):
+    source = SourceAudit(URL_MODE, URL, URL)
+    session = _SessionServeur(serveur_divergent, racine, URL)
+    with sp.acces_pour(source, session_factory=lambda: session) as acces:
+        rapport = auditer_communes(["13001", "13002"], source.racine, source=source, acces=acces)
+    assert session.ouvertures == [URL + "/Dep13/13001/audit_13001.xlsx", URL + "/Dep13/13002/audit_13002.xlsx"]
+    assert rapport.commune("13002").ids_non_valides == ["13002_1"]       # version serveur
+    assert rapport.commune("13002").chemin == URL + "/Dep13/13002/audit_13002.xlsx"
+
+
+def test_adresse_absente_sur_le_serveur_donne_fichier_introuvable(racine):
+    class SessionSansFichier(_SessionServeur):
+        def copier_version_serveur(self, url, destination, on_etape=None):
+            raise Exception(-2147352567, "Exception", (0, "Microsoft Excel",
+                            "Désolé... Nous ne trouvons pas audit_99999.xlsx.", None, 0, -2146827284), None)
+
+    source = SourceAudit(URL_MODE, URL, URL)
+    with sp.acces_pour(source, lambda: SessionSansFichier("", racine, URL)) as acces:
+        c = auditer_communes(["99999"], URL, source=source, acces=acces).communes[0]
+    from avf.models.audit import StatutAudit
+    assert c.statut is StatutAudit.INTROUVABLE and "introuvable sur SharePoint" in c.message
+
+
+def test_audit_par_ids_en_mode_adresse(racine, serveur_divergent):
+    source = SourceAudit(URL_MODE, URL, URL)
+    session = _SessionServeur(serveur_divergent, racine, URL)
+    with sp.acces_pour(source, lambda: session) as acces:
+        r = auditer_communes(["13002"], URL, source=source, acces=acces, ids={"13002": ["13002_1"]})
+    assert r.commune("13002").ids_non_valides == ["13002_1"] and r.nb_lignes == 1
+
+
+def test_mise_a_jour_par_adresse(racine):
+    """La mise à jour ouvre le fichier par son adresse, sans repérage local ni copie de conflit."""
+    session = _SessionServeur("", racine, URL)
+    vus = []
+
+    def appliquer(fichier, config, ids, on_etape=None):
+        vus.append(fichier)
+        from sna.services.excel import BilanFichier
+        return BilanFichier(comptes={"R1": 1}, ids_trouves=set(ids))
+    session.appliquer_regles = appliquer
+    bilan = mettre_a_jour({"75021": ["75021_1"]}, ReglesConfig.defaut(), URL,
+                          session_factory=lambda: session, source=SourceAudit(URL_MODE, URL, URL))
+    assert vus == [URL + "/Dep75/75021/audit_75021.xlsx"]
+    assert bilan.nb_communes_ok == 1 and bilan.echecs == {}      # pas de refus « copie de conflit »

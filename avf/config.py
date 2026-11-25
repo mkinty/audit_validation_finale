@@ -4,6 +4,7 @@
     racine          → dossier racine des audits (source locale)
     lien_sharepoint → lien SharePoint du dossier racine (source SharePoint)
     communes        → dernière sélection de communes
+    ids_cibles      → ID erreur saisis pour un audit restreint (vide : communes entières)
     colonnes        → libellés des colonnes auditées (Validation finale, Audit…)
     regles          → règles de mise à jour, au format de complete_excel_files
                       (``sna.models.regles.ReglesConfig``) : valeurs par défaut
@@ -39,6 +40,7 @@ class Parametres:
     racine: str = ""
     lien_sharepoint: str = ""
     communes: list[str] = field(default_factory=list)
+    ids_cibles: list[str] = field(default_factory=list)
     colonnes: ColonnesAudit = field(default_factory=ColonnesAudit)
     regles: ReglesConfig = field(default_factory=ReglesConfig.defaut)
     date_du_jour: bool = True
@@ -53,6 +55,7 @@ class Parametres:
             "racine": self.racine,
             "lien_sharepoint": self.lien_sharepoint,
             "communes": list(self.communes),
+            "ids_cibles": list(self.ids_cibles),
             "colonnes": self.colonnes.to_dict(),
             "regles": self.regles.to_dict(),
             "date_du_jour": self.date_du_jour,
@@ -71,6 +74,7 @@ class Parametres:
             racine=str(data.get("racine") or ""),
             lien_sharepoint=str(data.get("lien_sharepoint") or "").strip(),
             communes=_liste(data.get("communes")),
+            ids_cibles=_liste(data.get("ids_cibles")),
             colonnes=ColonnesAudit.from_dict(data.get("colonnes")),
             regles=_regles(data.get("regles")),
             date_du_jour=bool(data.get("date_du_jour", defaut.date_du_jour)),

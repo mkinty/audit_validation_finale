@@ -72,6 +72,8 @@ def traiter_communes(
     paralleles: int = 1,
     doit_arreter: Callable[[], bool] | None = None,
     prereperage: bool = True,
+    localiser: Callable[[str, str], str | None] | None = None,
+    conflits: Callable[[str, str], list[dict]] | None = None,
 ) -> list[ResultatCommune]:
     """Applique les règles aux lignes des ID erreur, commune par commune.
 
@@ -93,6 +95,11 @@ def traiter_communes(
             le fichier parcouru n'est pas celui qu'Excel ouvrira (audit depuis
             SharePoint via une bibliothèque synchronisée : la copie locale peut
             différer du serveur) — Excel est alors toujours ouvert.
+        localiser: ``(racine, commune) → fichier`` ; par défaut
+            ``trouver_fichier_audit``. Permet de désigner un fichier par son
+            adresse SharePoint quand le dossier ne peut pas être parcouru.
+        conflits: ``(racine, commune) → copies de conflit`` ; par défaut
+            ``detecter_fichiers_conflit``.
 
     Returns:
         La liste des :class:`ResultatCommune`, dans l'ordre des communes demandées.
@@ -104,7 +111,7 @@ def traiter_communes(
     if paralleles > 1 and total > 1:
         resultats = _traiter_en_parallele(
             communes, groupes, config, racine, simuler, on_progression, on_resultat, on_etape,
-            session_excel, paralleles, doit_arreter, prereperage,
+            session_excel, paralleles, doit_arreter, prereperage, localiser, conflits,
         )
     else:
         resultats = []
@@ -118,6 +125,7 @@ def traiter_communes(
             )
             resultat = _traiter_une_commune(
                 commune, ids, config, racine, simuler, on_etape, session_excel, prereperage,
+                localiser, conflits,
             )
             resultats.append(resultat)
             if on_resultat is not None:
@@ -129,7 +137,7 @@ def traiter_communes(
 
 def _traiter_en_parallele(
     communes, groupes, config, racine, simuler, on_progression, on_resultat, on_etape,
-    session_excel, paralleles, doit_arreter, prereperage=True,
+    session_excel, paralleles, doit_arreter, prereperage=True, localiser=None, conflits=None,
 ) -> list[ResultatCommune]:
     """Pool de threads ; résultats dans l'ordre des communes demandées."""
     total = len(communes)
@@ -144,6 +152,7 @@ def _traiter_en_parallele(
         ids = list(groupes[commune])
         resultat = _traiter_une_commune(
             commune, ids, config, racine, simuler, on_etape, session_excel, prereperage,
+            localiser, conflits,
         )
         with verrou:   # callbacks un à la fois, dans l'ordre de fin
             faits += 1
@@ -167,6 +176,8 @@ def _traiter_une_commune(
     on_etape: CallbackEtape | None,
     session_excel,
     prereperage: bool = True,
+    localiser=None,
+    conflits=None,
 ) -> ResultatCommune:
     """Traite une seule commune et renvoie son résultat (ne lève jamais)."""
     def etape(message: str) -> None:
@@ -174,14 +185,14 @@ def _traiter_une_commune(
             on_etape(commune, message)
 
     etape("recherche du fichier audit…")
-    fichier = trouver_fichier_audit(racine, commune)
+    fichier = (localiser or trouver_fichier_audit)(racine, commune)
     if fichier is None:
         return ResultatCommune(
             commune, Statut.INTROUVABLE,
             message="fichier introuvable", nb_ids_demandes=len(ids),
         )
 
-    conflits = detecter_fichiers_conflit(racine, commune)
+    conflits = (conflits or detecter_fichiers_conflit)(racine, commune)
     if conflits:
         detail = ", ".join(
             f"{os.path.basename(c['chemin'])} (conflit du {c['date']})" for c in conflits

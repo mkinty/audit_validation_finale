@@ -4,12 +4,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-LOCAL, WEBDAV, EXCEL = "local", "webdav", "excel"
+LOCAL, WEBDAV, EXCEL, URL = "local", "webdav", "excel", "url"
 
 _LIBELLES = {
     LOCAL: "Dossier local",
     WEBDAV: "SharePoint — accès direct (WebDAV)",
     EXCEL: "SharePoint — via Excel (bibliothèque synchronisée)",
+    URL: "SharePoint — via Excel (sans synchronisation)",
 }
 
 
@@ -26,10 +27,23 @@ class SourceAudit:
     mode: str
     racine: str
     lien: str = ""
+    diagnostic: str = ""   # pourquoi l'accès direct (WebDAV) n'a pas été retenu
 
     @property
     def sharepoint(self) -> bool:
         return self.mode != LOCAL
+
+    @property
+    def listable(self) -> bool:
+        """Faux en mode ``url`` : le dossier ne peut pas être parcouru, les communes
+        (ou ID erreur) doivent être saisies ; leurs fichiers sont ouverts par adresse."""
+        return self.mode != URL
+
+    def url_fichier(self, commune: str) -> str:
+        """Mode ``url`` : adresse du fichier audit d'une commune
+        (``<lien>/Dep<XX>/<commune>/audit_<commune>.xlsx``)."""
+        code = commune.strip().upper()
+        return f"{self.lien.rstrip('/')}/Dep{code[:2]}/{code}/audit_{code}.xlsx"
 
     @property
     def libelle(self) -> str:

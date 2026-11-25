@@ -66,6 +66,7 @@ def _entete(r: RapportAudit) -> str:
         f"<span>⏱ <strong>Durée</strong> {escape(p.duree(r.duree))}</span></p>"
         f'<p class="meta"><span>🔎 <strong>Colonnes lues</strong> (onglet « Audit ») : {colonnes}</span></p>'
         f'<p class="meta"><span>✅ <strong>Ligne validée si</strong> {criteres}</span></p>'
+        + (f'<p class="meta"><span>{escape(p.perimetre(r))}</span></p>' if r.par_ids else "")
     )
 
 

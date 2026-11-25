@@ -22,6 +22,8 @@ non valides, avec le **même moteur que complete_excel_files**.
    codes INSEE (`13001 2A004`…), le dossier `Dep<XX>` étant déduit des deux
    premiers caractères. Les codes sans dossier sont signalés et ignorés.
    L'utilisateur ne choisit jamais de département.
+   `🎯 ID erreur…` limite l'audit à des **ID erreur** saisis (voir « Audit de
+   quelques ID erreur »).
 3. **Audit** : contrôle de chaque ligne de l'onglet **« Audit »**, journal en temps réel,
    arrêt possible. Le rapport s'ouvre en popup à la fin. `💾 HTML`, `📊 Excel` et `📑 CSV`
    l'exportent, puis proposent de l'ouvrir dans le navigateur ou dans Excel.
@@ -30,7 +32,9 @@ non valides, avec le **même moteur que complete_excel_files**.
    sélectionnée).
 
 La sélection (racine, communes) et les options sont conservées
-d'un lancement à l'autre.
+d'un lancement à l'autre. Toute la fenêtre **défile** (barre à droite, molette) quand
+l'écran est trop petit pour l'afficher en entier. Le journal et la liste des communes
+gardent leur propre défilement.
 
 ## Audit depuis SharePoint
 
@@ -49,7 +53,20 @@ contient pas le chemin du dossier : il est refusé, avec la marche à suivre.
 | Mode | Comment | Conditions |
 |---|---|---|
 | **Accès direct (WebDAV)** | Le lien devient un chemin réseau `\\hôte@SSL\DavWWWRoot\…`, comme « Afficher dans l'Explorateur de fichiers » de SharePoint. Détection des communes et lecture des fichiers se font **directement sur le serveur**, exactement comme pour un dossier local. | Service Windows **WebClient** démarré ; session Microsoft 365 ouverte sur le poste (se connecter une fois à SharePoint dans Edge en cochant « Rester connecté »). |
-| **Via Excel** (repli) | Les communes sont listées depuis la bibliothèque **synchronisée par OneDrive**. Chaque `audit_*.xlsx` est ensuite **ouvert par son adresse SharePoint** dans l'instance Excel dédiée (lecture seule, compte Office), copié dans un dossier temporaire puis lu. Le contenu audité est donc celui du serveur. | Bibliothèque synchronisée sur le poste ; Excel installé. Plus lent : une ouverture Excel par commune. |
+| **Via Excel, bibliothèque synchronisée** (1er repli) | Les communes sont listées depuis la bibliothèque **synchronisée par OneDrive**. Chaque `audit_*.xlsx` est ensuite **ouvert par son adresse SharePoint** dans l'instance Excel dédiée (lecture seule, compte Office), copié dans un dossier temporaire puis lu. Le contenu audité est donc celui du serveur. | Bibliothèque synchronisée sur le poste ; Excel installé. Plus lent : une ouverture Excel par commune. |
+| **Via Excel, sans synchronisation** (2e repli) | Le dossier ne peut pas être parcouru : on renseigne les communes (`✏️`) ou les ID erreur (`🎯`), et « Détecter toutes les communes » est désactivé. Le fichier de chaque commune est ouvert à l'adresse `<lien>/Dep<XX>/<commune>/audit_<commune>.xlsx`. Une adresse vide donne « Fichier introuvable ». Les copies de conflit ne sont pas détectables dans ce mode. | Excel installé. |
+
+**Erreur 224 « Accès refusé… sites approuvés »** : Windows n'a pas de session
+SharePoint pour l'accès direct. Depuis la fin d'Internet Explorer, Edge ne lui transmet
+plus la connexion. L'outil passe alors à un repli et affiche la cause. Pour rétablir
+l'accès direct, ouvrez le dossier dans SharePoint avec Edge puis cliquez sur « Afficher
+dans l'Explorateur de fichiers ».
+
+**Connexion Microsoft 365** : si Office demande de se connecter au compte professionnel
+(fenêtre « Se connecter »), l'outil le détecte en quelques secondes. Une fenêtre Excel
+**visible** s'ouvre alors : connectez-vous une fois, puis le traitement reprend, en audit
+comme en mise à jour. Office mémorise la connexion pour les fois suivantes. Avant, une
+instance Excel invisible restait bloquée sur cette fenêtre jusqu'au délai anti-blocage.
 
 Le mode obtenu s'affiche sous le lien et figure dans le journal et dans tous les
 rapports (« Source : SharePoint — … »). En mode Excel, l'adresse SharePoint de chaque
@@ -64,6 +81,32 @@ refusée si le rapport a été produit sur une autre source que celle choisie à
 
 **Limite** : en mode via Excel, la **simulation** compte les modifications sur la copie
 locale synchronisée, pas sur le serveur.
+
+## Audit de quelques ID erreur
+
+`🎯 ID erreur…` (étape 2) audite seulement les ID erreur collés, au lieu des communes
+entières. On les colle séparés par des espaces, des virgules ou des retours à la ligne :
+`13001_2, 13001_15  2a004_1`.
+
+- La commune, et donc le dossier `<racine>/Dep<XX>/<commune>`, est déduite du code INSEE
+  en préfixe, comme dans complete_excel_files (`sna.services.identifiants`). Les communes
+  concernées sont listées et sélectionnées.
+- Seules les lignes de ces ID sont contrôlées, toutes leurs lignes en cas de doublon.
+  Les indicateurs, le détail et les exports ne portent que sur elles.
+- Un ID **absent de son fichier** est signalé : avertissement sur la commune, ligne
+  « ID introuvable » dans les exports CSV et Excel, et liste dans le bilan.
+- Sont aussi signalés : un ID dont la commune n'a pas de dossier, et un code INSEE saisi
+  sans numéro (`13002`). Ils sont ignorés.
+- Le **périmètre** (« 🎯 Audit limité à N ID erreur saisi(s) — K introuvable(s) ») figure
+  sous la liste des communes, dans le journal, la fenêtre du rapport, le HTML et la
+  synthèse Excel.
+- La mise à jour ne touche que les ID saisis non valides. Le ré-audit qui la suit reste
+  limité aux mêmes ID.
+- Les ID saisis sont mémorisés d'un lancement à l'autre. `✖ Communes entières`,
+  `🔍 Détecter toutes les communes` ou `✏️ Renseigner…` reviennent à l'audit des
+  communes entières.
+
+Cela fonctionne aussi en source SharePoint.
 
 ## Règle d'audit
 
@@ -272,10 +315,10 @@ audit_validation_finale/
 .venv\Scripts\python -m pytest
 ```
 
-457 tests : détection, lecture (chemin rapide et repli openpyxl comparés),
+482 tests : détection, lecture (chemin rapide et repli openpyxl comparés),
 critères de validité (dates en texte, casse, valeurs acceptées), audit par ligne et par
 ID, rapport HTML (structure, échappement, données de copie par catégorie), exports
-Excel et CSV, source SharePoint (formats de lien, WebDAV, bibliothèque synchronisée,
+Excel et CSV, audit limité à des ID erreur saisis, source SharePoint (formats de lien, WebDAV, bibliothèque synchronisée,
 lecture de la version serveur, connexion lente ou refusée, mise à jour forcée via Excel),
 configuration,
 mise à jour de bout en bout (valeurs écrites cellule par cellule, simulation,

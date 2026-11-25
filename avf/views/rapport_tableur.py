@@ -48,6 +48,9 @@ def lignes_detail(rapport: RapportAudit, categorie: str = TOUTES) -> list[list]:
             continue
         for l in c.lignes_de(categorie):
             lignes.append(_ligne(c, l))
+        for i in c.ids_introuvables:          # audit par ID : ID saisi absent du fichier
+            lignes.append([f"Dep{c.departement}", c.commune, i, None, "ID introuvable",
+                           "", "", "", "", "absent du fichier audit", c.chemin])
     return lignes
 
 
@@ -93,7 +96,9 @@ def _synthese(ws, r: RapportAudit) -> None:
                f"{r.colonnes.date_audit}, {r.colonnes.auditeur}"
     ws["A1"].font = _TITRE
     lignes = [
-        ("Racine", r.racine), ("Source", r.libelle_source), ("Généré le", f"{r.date:%d/%m/%Y %H:%M}"), ("Durée", p.duree(r.duree)),
+        ("Racine", r.racine), ("Source", r.libelle_source),
+        *([("Périmètre", p.perimetre(r).removeprefix("🎯 "))] if r.par_ids else []),
+        ("Généré le", f"{r.date:%d/%m/%Y %H:%M}"), ("Durée", p.duree(r.duree)),
         None,
         ("Critères d'une ligne validée", None),
         *((f"  {libelle}", None) for libelle in p.libelles_criteres(r.colonnes).values()),

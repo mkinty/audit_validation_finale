@@ -6,7 +6,7 @@ atteindre SharePoint (conflit de synchronisation, copie « -NOMDUPC », envoi en
 ne voit. Ici, l'utilisateur colle le lien SharePoint du dossier racine et
 l'audit lit ce que contient réellement le serveur.
 
-Deux accès, sans inscription d'application ni droits d'administrateur :
+Trois accès, sans inscription d'application ni droits d'administrateur :
 
 ``webdav`` — accès direct (préféré)
     Le lien devient un chemin réseau WebDAV ``\\\\hôte@SSL\\DavWWWRoot\\…``,
@@ -23,6 +23,17 @@ Deux accès, sans inscription d'application ni droits d'administrateur :
     l'utilisateur), copié dans un dossier temporaire puis lu. Le contenu audité
     est donc celui du serveur. Plus lent (une ouverture Excel par commune).
 
+``url`` — via Excel, sans synchronisation (dernier recours)
+    Ni WebDAV ni synchronisation : le dossier ne peut pas être parcouru. Les
+    communes (ou ID erreur) sont saisies, et le fichier de chaque commune est
+    ouvert par son adresse ``<lien>/Dep<XX>/<commune>/audit_<commune>.xlsx``
+    (nommage des fichiers audit). Pas de détection des copies de conflit.
+
+Avec Excel, si Office demande la connexion Microsoft 365 (compte
+professionnel), une fenêtre Excel visible s'ouvre une fois pour que
+l'utilisateur se connecte ; les ouvertures suivantes sont silencieuses
+(``SessionExcel(connexion_interactive=True)``).
+
 La mise à jour, en source SharePoint, passe toujours par Excel (co-édition) :
 jamais de réécriture directe du fichier sur le serveur.
 """
@@ -38,9 +49,10 @@ import tempfile
 import threading
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
+from sna.services.fichiers import detecter_fichiers_conflit, trouver_fichier_audit
 from sna.services.onedrive import montages_onedrive, url_sharepoint
 
-from ..models.source import SourceAudit
+from ..models.source import EXCEL, URL, WEBDAV, SourceAudit
 
 _RACINE_WEBDAV = re.compile(r"^\\\\(?P<hote>[^\\@]+)@SSL(?:@\d+)?\\DavWWWRoot(?P<chemin>\\.*)?$", re.I)
 # Liens de partage : https://hote/:f:/r/sites/X/... (« r » = chemin réel, résoluble)
@@ -156,9 +168,13 @@ def connecter(
     texte: str,
     delai_s: float = 45,
     montages: list[tuple[str, str]] | None = None,
-    est_dossier: Callable[[str], bool] = os.path.isdir,
+    est_dossier: Callable[[str], bool] | None = None,
+    excel_present: Callable[[], bool] | None = None,
 ) -> SourceAudit:
-    """Trouve un accès au dossier SharePoint : WebDAV, sinon bibliothèque synchronisée.
+    """Trouve un accès au dossier SharePoint : WebDAV, bibliothèque synchronisée,
+    sinon ouverture des fichiers par adresse via Excel (mode ``url``).
+
+    ``SourceAudit.diagnostic`` explique pourquoi l'accès direct n'a pas été retenu.
 
     Raises:
         LienInvalide: lien inexploitable.
@@ -166,24 +182,54 @@ def connecter(
     """
     lien = analyser_lien(texte)
     webdav = lien.chemin_webdav
+    est_dossier = est_dossier or _dossier_accessible
     ok, erreur = _avec_delai(lambda: est_dossier(webdav), delai_s)
     if ok:
-        return SourceAudit("webdav", webdav, lien.url)
+        return SourceAudit(WEBDAV, webdav, lien.url)
+    cause = _cause_webdav(erreur)
     local = dossier_synchronise(lien, montages)
-    if local and est_dossier(local):
-        return SourceAudit("excel", local, lien.url)
-    cause = "délai dépassé" if erreur == "delai" else (erreur or "accès refusé ou dossier introuvable")
+    if local and _sans_erreur(est_dossier, local):
+        return SourceAudit(EXCEL, local, lien.url, diagnostic=cause)
+    if (excel_present or _excel_present)():
+        return SourceAudit(URL, lien.url, lien.url, diagnostic=cause)
     raise AccesImpossible(
-        f"dossier SharePoint injoignable ({cause}).\n\n"
+        f"dossier SharePoint injoignable — accès direct refusé : {cause}\n\n"
         f"Accès direct (WebDAV) : {webdav}\n"
         "• Vérifiez le lien (il doit ouvrir le dossier racine dans le navigateur).\n"
-        "• Connectez-vous à SharePoint dans Microsoft Edge en cochant « Rester connecté », "
-        "puis réessayez — ou ouvrez une fois le dossier via « Afficher dans l'Explorateur "
-        "de fichiers ».\n"
-        "• Le service Windows « WebClient » doit être démarré.\n"
-        "• À défaut, synchronisez la bibliothèque avec OneDrive : l'audit lira alors chaque "
-        "fichier sur le serveur via Excel."
+        "• Ouvrez le dossier dans SharePoint avec Microsoft Edge, puis « Afficher dans "
+        "l'Explorateur de fichiers » : Windows mémorise alors la connexion.\n"
+        "• Ou synchronisez la bibliothèque avec OneDrive (bouton « Synchroniser » de SharePoint).\n"
+        "• Ou installez Excel : les fichiers seraient ouverts sur le serveur par leur adresse."
     )
+
+
+def _dossier_accessible(chemin: str) -> bool:
+    """Lister le dossier, pour obtenir la vraie cause d'un refus (``os.path.isdir`` la tait)."""
+    os.listdir(chemin)
+    return True
+
+
+def _sans_erreur(fonction: Callable[[str], bool], chemin: str) -> bool:
+    try:
+        return bool(fonction(chemin))
+    except OSError:
+        return False
+
+
+def _excel_present() -> bool:
+    from sna.services.excel_com import excel_disponible
+    return excel_disponible()
+
+
+def _cause_webdav(erreur: str | None) -> str:
+    """Message Windows → explication actionnable."""
+    if erreur == "delai":
+        return "le serveur n'a pas répondu à temps"
+    texte = (erreur or "accès refusé ou dossier introuvable").strip()
+    if "sites approuvés" in texte or "trusted sites" in texte.lower():
+        return ("Windows n'a pas de session SharePoint pour l'accès direct (erreur 224) — "
+                "ouvrez le dossier dans Edge puis « Afficher dans l'Explorateur de fichiers »")
+    return texte
 
 
 def _avec_delai(fonction: Callable[[], bool], delai_s: float) -> tuple[bool, str | None]:
@@ -218,6 +264,14 @@ class AccesFichiers:
     def __exit__(self, *exc) -> bool:
         return False
 
+    def trouver(self, racine: str, commune: str) -> str | None:
+        """Fichier audit de la commune (``None`` : aucun)."""
+        return trouver_fichier_audit(racine, commune)
+
+    def conflits(self, racine: str, commune: str) -> list[dict]:
+        """Copies de conflit OneDrive/SharePoint présentes à côté du fichier."""
+        return detecter_fichiers_conflit(racine, commune)
+
     def lisible(self, chemin: str) -> str:
         """Chemin d'un fichier à lire, au contenu identique à celui de la source."""
         return chemin
@@ -234,8 +288,7 @@ class AccesViaExcel(AccesFichiers):
     def __init__(self, source: SourceAudit, session_factory=None,
                  montages: list[tuple[str, str]] | None = None):
         if session_factory is None:
-            from sna.services.excel_com import SessionExcel
-            session_factory = SessionExcel
+            session_factory = session_excel_interactive
         self.source = source
         self._montages = montages   # None : bibliothèques synchronisées du registre
         self._fabrique = session_factory
@@ -263,19 +316,63 @@ class AccesViaExcel(AccesFichiers):
         return url_sharepoint(chemin, self._montages) or chemin
 
     def lisible(self, chemin: str) -> str:
-        url = url_sharepoint(chemin, self._montages)
+        url = self._url(chemin)
         if url is None:
             raise AccesImpossible(f"adresse SharePoint inconnue pour {chemin} (dossier non synchronisé ?)")
         with self._verrou:
             self._compteur += 1
-            destination = os.path.join(self._dossier, f"{self._compteur:05d}_{os.path.basename(chemin)}")
-        self._session.copier_version_serveur(url, destination)
+            nom = url.rsplit("/", 1)[-1].replace("%20", " ")
+            destination = os.path.join(self._dossier, f"{self._compteur:05d}_{nom}")
+        try:
+            self._session.copier_version_serveur(url, destination)
+        except Exception as exc:
+            if _est_introuvable(exc):
+                raise FichierIntrouvable(f"fichier introuvable sur SharePoint : {url}") from None
+            raise
         return destination
+
+    def _url(self, chemin: str) -> str | None:
+        return url_sharepoint(chemin, self._montages)
+
+
+class AccesParAdresse(AccesViaExcel):
+    """Source ``url`` : le dossier ne se parcourt pas ; le fichier d'une commune est
+    désigné par son adresse (``SourceAudit.url_fichier``) et ouvert via Excel."""
+
+    def trouver(self, racine: str, commune: str) -> str | None:
+        return self.source.url_fichier(commune)
+
+    def conflits(self, racine: str, commune: str) -> list[dict]:
+        return []   # non détectables sans parcourir le dossier
+
+    def adresse(self, chemin: str) -> str:
+        return chemin
+
+    def _url(self, chemin: str) -> str | None:
+        return chemin
+
+
+class FichierIntrouvable(FileNotFoundError):
+    """Le fichier audit n'existe pas à l'adresse attendue sur SharePoint."""
+
+
+def _est_introuvable(exc: BaseException) -> bool:
+    texte = " ".join(str(a) for a in getattr(exc, "args", ()) if a).lower()
+    return any(m in texte for m in ("introuvable", "trouvons pas", "n'existe pas", "n’existe pas",
+                                     "couldn't find", "could not find", "not found", "does not exist"))
+
+
+def session_excel_interactive():
+    """Session Excel qui montre la fenêtre de connexion Microsoft 365 si Office la demande."""
+    from sna.services.excel_com import SessionExcel
+    return SessionExcel(connexion_interactive=True)
 
 
 def acces_pour(source: SourceAudit, session_factory=None,
                montages: list[tuple[str, str]] | None = None) -> AccesFichiers:
     """Accès aux fichiers adapté à la source (contexte à ouvrir avec ``with``)."""
-    if source.mode == "excel":
+    if source.mode == EXCEL:
         return AccesViaExcel(source, session_factory, montages)
+    if source.mode == URL:
+        return AccesParAdresse(source, session_factory, montages)
     return AccesFichiers()

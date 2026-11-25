@@ -104,4 +104,14 @@ def resume(rapport: RapportAudit) -> list[str]:
         f"{nombre(rapport.nb_lignes_valides)} validée(s) ({pourcent(rapport.taux)}), "
         f"{nombre(rapport.nb_lignes_non_valides)} non valide(s) · "
         f"{nombre(rapport.nb_ids_non_valides)} ID erreur non valide(s) sur {nombre(rapport.nb_ids)}",
-    ]
+    ] + ([perimetre(rapport)] if rapport.par_ids else [])
+
+
+def perimetre(rapport: RapportAudit) -> str:
+    """« 🎯 12 ID erreur saisis — 2 introuvable(s) : … » (audit restreint à des ID)."""
+    introuvables = rapport.ids_introuvables()
+    texte = f"🎯 Audit limité à {nombre(rapport.nb_ids_demandes)} ID erreur saisi(s)"
+    if introuvables:
+        apercu = ", ".join(introuvables[:10]) + ("…" if len(introuvables) > 10 else "")
+        texte += f" — {nombre(len(introuvables))} introuvable(s) : {apercu}"
+    return texte

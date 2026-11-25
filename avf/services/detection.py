@@ -20,12 +20,13 @@ Aucune fonction ne lève sur un dossier illisible : il est simplement ignoré.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 import os
 import re
 
 from sna.services.fichiers import PREFIXE_DEP, dossier_commune
+from sna.services.identifiants import codes_sans_id, groupes_depuis_texte
 
 # Séparateurs acceptés dans une saisie : virgule, point-virgule, espaces, retours.
 _SEPARATEURS = re.compile(r"[\s,;|]+")
@@ -84,7 +85,8 @@ class VerificationCommunes:
     absentes: list[str] = field(default_factory=list)
 
 
-def verifier_communes(racine: str, codes: Iterable[str]) -> VerificationCommunes:
+def verifier_communes(racine: str, codes: Iterable[str],
+                       existe: Callable[[str], bool] = os.path.isdir) -> VerificationCommunes:
     """Confronte des codes communes saisis au disque.
 
     Une commune est trouvée si ``<racine>/Dep<XX>/<commune>`` existe, ``XX``
@@ -93,7 +95,7 @@ def verifier_communes(racine: str, codes: Iterable[str]) -> VerificationCommunes
     resultat = VerificationCommunes()
     for code in codes:
         dossier = dossier_commune(racine, code)
-        if os.path.isdir(dossier):
+        if existe(dossier):
             resultat.trouvees.append(CommuneDetectee(
                 code=code, departement=departement_de(code),
                 dossier=dossier, a_fichier=_contient_audit(dossier),
@@ -101,6 +103,41 @@ def verifier_communes(racine: str, codes: Iterable[str]) -> VerificationCommunes
         else:
             resultat.absentes.append(code)
     return resultat
+
+
+@dataclass
+class SaisieIds:
+    """ID erreur saisis, répartis par commune et confrontés au disque."""
+
+    groupes: dict[str, list[str]] = field(default_factory=dict)    # communes trouvées → ID
+    absents: dict[str, list[str]] = field(default_factory=dict)    # communes sans dossier → ID
+    codes_sans_id: list[str] = field(default_factory=list)         # « 13001 » saisi sans « _n »
+    trouvees: list[CommuneDetectee] = field(default_factory=list)
+
+    @property
+    def nb_ids(self) -> int:
+        return sum(len(v) for v in self.groupes.values())
+
+    @property
+    def ids(self) -> list[str]:
+        return [i for v in self.groupes.values() for i in v]
+
+
+def verifier_ids(racine: str, texte: str, existe: Callable[[str], bool] = os.path.isdir) -> SaisieIds:
+    """Texte libre (ID séparés par espaces, virgules, retours à la ligne…) → ID par commune.
+
+    Même lecture que complete_excel_files (``sna.services.identifiants``) : un ID
+    s'écrit ``<insee>_<numéro>`` (``13001_2``, ``2a004_1``) et son préfixe INSEE
+    désigne la commune, donc le dossier ``<racine>/Dep<XX>/<insee>``. Les codes
+    INSEE saisis seuls sont remontés à part : sans numéro, aucune ligne à auditer.
+    """
+    saisie = SaisieIds(codes_sans_id=codes_sans_id(texte or ""))
+    groupes = groupes_depuis_texte(texte or "")
+    verification = verifier_communes(racine, list(groupes), existe)
+    saisie.trouvees = verification.trouvees
+    saisie.groupes = {c.code: groupes[c.code] for c in verification.trouvees}
+    saisie.absents = {code: groupes[code] for code in verification.absentes}
+    return saisie
 
 
 # ── Helpers ───────────────────────────────────────────────────────

@@ -262,7 +262,9 @@ class FenetreRapport(tk.Toplevel):
                   zip(p.libelles_criteres(r.colonnes).values(), r.par_critere().values())]
         self.lbl_motifs.config(text="Lignes non valides par critère non respecté —  " + "   ·   ".join(motifs))
         racine = r.racine if len(r.racine) <= 70 else "…" + r.racine[-69:]
-        self.lbl_meta.config(text=f"{racine}\n{r.libelle_source} · {r.date:%d/%m/%Y %H:%M} · {p.duree(r.duree)}")
+        cible = f" · 🎯 {p.nombre(r.nb_ids_demandes)} ID saisis" if r.par_ids else ""
+        self.lbl_meta.config(
+            text=f"{racine}\n{r.libelle_source}{cible} · {r.date:%d/%m/%Y %H:%M} · {p.duree(r.duree)}")
         etat_maj = "normal" if (self.on_mettre_a_jour and r.nb_ids_non_valides) else "disabled"
         self.btn_maj_tout.config(state=etat_maj,
                                  text=f"🛠️ Mettre à jour les {p.nombre(r.nb_ids_non_valides)} ID non valides")

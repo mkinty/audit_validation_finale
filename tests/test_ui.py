@@ -500,3 +500,139 @@ def test_source_sharepoint_retrouvee_au_lancement(tmp_path, racine, monkeypatch,
     finally:
         a.destroy()
         gc.collect()
+
+
+# ── Audit restreint à des ID erreur ───────────────────────────────
+def _saisir_ids(app, monkeypatch, texte):
+    monkeypatch.setattr(DialogueSaisie, "montrer", lambda self: texte)
+    app._renseigner_ids()
+
+
+def test_audit_par_ids_puis_mise_a_jour_et_reaudit(app, racine, monkeypatch, dialogues):
+    app.var_racine.set(racine)
+    app._enregistrer_racine()
+    _saisir_ids(app, monkeypatch, "13001_2 13001_5 13001_99\n2a004_2")
+    assert app.liste_com.codes == ["13001", "2A004"] and app._communes_choisies() == ["13001", "2A004"]
+    assert app.cadre_perimetre.winfo_manager() == "pack"
+    assert "4 ID erreur sur 2 commune(s)" in app.lbl_perimetre["text"]
+    assert charger(app.fichier_config).ids_cibles == ["13001_2", "13001_5", "13001_99", "2A004_2"]
+
+    app._lancer_audit()
+    attendre(app)
+    r = app.rapport
+    assert r.par_ids and r.nb_lignes == 4 and r.ids_introuvables() == ["13001_99"]
+    journal = app.txt_log.get("1.0", tk.END)
+    assert "Limité à 4 ID erreur" in journal and "introuvable(s) : 13001_99" in journal
+    assert "4 ID saisis" in app.fenetre_rapport.lbl_meta["text"]
+
+    # Mise à jour des ID non valides du périmètre, ré-audit limité aux mêmes ID
+    app.fenetre_rapport._maj_tout()
+    attendre(app)
+    attendre(app)
+    r = app.rapport
+    assert r.par_ids and r.nb_lignes == 4 and r.nb_ids_non_valides == 0
+    # Hors périmètre, rien n'a été touché : 2A004_1 reste non valide
+    complet = module_app.auditer_communes(["2A004"], racine)
+    assert complet.commune("2A004").ids_non_valides == ["2A004_1"]
+
+
+def test_saisie_ids_signale_les_problemes(app, racine, monkeypatch, dialogues):
+    app.var_racine.set(racine)
+    app._enregistrer_racine()
+    _saisir_ids(app, monkeypatch, "13001_2 99999_1 13002")
+    messages = " ".join(m for _, m in dialogues)
+    assert "99999 : 99999_1" in messages and "sans numéro" in messages and "13002" in messages
+    assert app.liste_com.codes == ["13001"]
+
+
+def test_saisie_ids_sans_rien_d_exploitable(app, racine, monkeypatch, dialogues):
+    app.var_racine.set(racine)
+    app._enregistrer_racine()
+    _saisir_ids(app, monkeypatch, "bonjour")
+    assert any("Aucun ID erreur exploitable" in m for _, m in dialogues)
+    assert app.ids_cibles == {}
+
+
+def test_retour_aux_communes_entieres(app, racine, monkeypatch):
+    app.var_racine.set(racine)
+    app._enregistrer_racine()
+    _saisir_ids(app, monkeypatch, "13001_2")
+    app._effacer_ids()
+    assert app.ids_cibles == {} and not app.cadre_perimetre.winfo_manager()
+    assert charger(app.fichier_config).ids_cibles == []
+    _saisir_ids(app, monkeypatch, "13001_2")
+    app._detecter_communes()                         # détecter les communes : communes entières
+    assert app.ids_cibles == {}
+    app._lancer_audit(["13001"])
+    attendre(app)
+    assert not app.rapport.par_ids and app.rapport.nb_lignes == 6
+
+
+def test_ids_saisis_retrouves_au_lancement(tmp_path, racine, dialogues):
+    import json
+    cfg = str(tmp_path / "cfg.json")
+    json.dump({"racine": racine, "ids_cibles": ["13001_2", "2A004_1"], "communes": ["2A004"]},
+              open(cfg, "w", encoding="utf-8"))
+    a = module_app.Application(fichier_config=cfg, fichier_attente=str(tmp_path / "att.json"))
+    a.withdraw()
+    try:
+        assert a.ids_cibles == {"13001": ["13001_2"], "2A004": ["2A004_1"]}
+        assert a.liste_com.codes == ["13001", "2A004"] and a._communes_choisies() == ["2A004"]
+        assert "2 ID erreur" in a.lbl_perimetre["text"]
+    finally:
+        a.destroy()
+        gc.collect()
+
+
+# ── Mode « via Excel, sans synchronisation » ──────────────────────
+def test_mode_adresse_saisie_sans_parcours(app, monkeypatch, dialogues):
+    from avf.models.source import URL, SourceAudit
+    source = SourceAudit(URL, LIEN, LIEN, diagnostic="Windows n'a pas de session SharePoint (erreur 224)")
+    _connecter(app, monkeypatch, source)
+    texte = app.lbl_source["text"]
+    assert "sans synchronisation" in texte and "erreur 224" in texte and "renseignez les communes" in texte
+    assert str(app.btn_det_com["state"]) == "disabled"
+    app._detecter_communes()
+    assert any("ne peut pas être parcouru" in m for _, m in dialogues)
+    _saisir_ids(app, monkeypatch, "38153_1 38153_7")
+    assert app.liste_com.codes == ["38153"]              # retenue sans dossier vérifiable
+    monkeypatch.setattr(DialogueSaisie, "montrer", lambda self: "38153 38154")
+    app._renseigner_communes()
+    assert app.liste_com.codes == ["38153", "38154"]
+
+
+# ── Défilement de la fenêtre ──────────────────────────────────────
+def test_fenetre_defilante_sur_petit_ecran(app):
+    app.deiconify()
+    app.geometry("900x420")
+    app.update()
+    assert app.zone.defile() and app.zone.barre.winfo_ismapped()
+    app.zone.canvas.yview_moveto(0)
+    app.zone.voir(app.btn_maj)                           # étape 4, hors de vue au départ
+    app.update()
+    assert app.zone.canvas.yview()[0] > 0
+    app.geometry("1100x1400")
+    app.update()
+    assert not app.zone.defile() and not app.zone.barre.winfo_ismapped()
+    app.withdraw()
+
+
+def test_molette_fait_defiler_la_page_sauf_sur_le_journal(app):
+    app.deiconify()
+    app.geometry("900x420")
+    app.update()
+    app.zone.canvas.yview_moveto(0)
+
+    class Evenement:
+        def __init__(self, widget, delta):
+            self.widget, self.delta = widget, delta
+
+    assert app.zone._molette(Evenement(app.lbl_bilan, -120)) == "break"
+    app.update()
+    assert app.zone.canvas.yview()[0] > 0
+    for i in range(80):
+        app.journaliser(f"ligne {i}")
+    app.traiter_file()
+    app.txt_log.yview_moveto(0)
+    assert app.zone._molette(Evenement(app.txt_log, -120)) is None    # le journal défile lui-même
+    app.withdraw()

@@ -17,13 +17,12 @@ OneDrive/SharePoint dans le dossier est signalée dès l'audit, puisque la mise
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 import os
 import threading
 import time
 
-from sna.services.fichiers import detecter_fichiers_conflit, trouver_fichier_audit
 from sna.services.identifiants import normaliser_id
 
 from ..models.audit import AuditCommune, IdErreurAudit, LigneAudit, RapportAudit, StatutAudit
@@ -52,6 +51,7 @@ def auditer_communes(
     paralleles: int = 1,
     source: SourceAudit | None = None,
     acces: AccesFichiers | None = None,
+    ids: Mapping[str, Sequence[str]] | None = None,
 ) -> RapportAudit:
     """Audite chaque commune et retourne le rapport complet.
 
@@ -67,6 +67,12 @@ def auditer_communes(
     ``source`` (facultatif) décrit d'où viennent les fichiers — dossier local
     ou SharePoint, cf. ``services.sharepoint`` — et ``acces`` comment les lire
     (déjà ouvert par l'appelant ; par défaut : lecture directe).
+
+    ``ids`` (facultatif) restreint l'audit à des **ID erreur** saisis :
+    ``{commune: [ID erreur]}`` (cf. ``sna.services.identifiants.groupes_depuis_texte``).
+    Seules leurs lignes sont contrôlées ; un ID absent du fichier est signalé
+    (``AuditCommune.ids_introuvables``). Une commune de ``communes`` absente de
+    ``ids`` est auditée entièrement.
     """
     colonnes = colonnes or ColonnesAudit()
     codes = list(dict.fromkeys(normaliser_commune(c) for c in communes if str(c).strip()))
@@ -75,9 +81,11 @@ def auditer_communes(
     depart = time.perf_counter()
     total = len(codes)
 
+    cibles = {normaliser_commune(c): list(v) for c, v in ids.items()} if ids else {}
+
     def auditer(code: str) -> AuditCommune:
         return auditer_commune(code, racine, colonne_id, colonnes, ligne_entete, on_etape=on_etape,
-                               acces=acces)
+                               acces=acces, ids=cibles.get(code))
 
     _progresser(on_progression, 0, total, "Démarrage…")
     if paralleles > 1 and total > 1:
@@ -107,16 +115,21 @@ def auditer_commune(
     ligne_entete: int = 1,
     on_etape: CallbackEtape | None = None,
     acces: AccesFichiers | None = None,
+    ids: Sequence[str] | None = None,
 ) -> AuditCommune:
     """Audite une seule commune (ne lève jamais).
 
     ``acces`` : comment lire le fichier trouvé (version serveur en source
     SharePoint via Excel) et quelle adresse afficher.
+
+    ``ids`` : seulement ces ID erreur (toutes leurs lignes) ; ``None`` : toute la commune.
     """
     colonnes = colonnes or ColonnesAudit()
     acces = acces or AccesFichiers()
     code = normaliser_commune(commune)
     resultat = AuditCommune(commune=code, departement=departement_de(code))
+    if ids is not None:
+        resultat.ids_demandes = list(dict.fromkeys(normaliser_id(i) for i in ids if normaliser_id(i)))
 
     def etape(message: str) -> None:
         if on_etape is not None:
@@ -124,14 +137,14 @@ def auditer_commune(
 
     depart = time.perf_counter()
     etape("recherche du fichier audit…")
-    fichier = trouver_fichier_audit(racine, code)
+    fichier = acces.trouver(racine, code)
     if fichier is None:
         resultat.statut = StatutAudit.INTROUVABLE
         resultat.message = "aucun fichier audit_*.xlsx dans le dossier de la commune"
         return resultat
     resultat.chemin = acces.adresse(fichier)
 
-    for conflit in detecter_fichiers_conflit(racine, code):
+    for conflit in acces.conflits(racine, code):
         resultat.avertissements.append(
             f"copie en conflit : {os.path.basename(conflit['chemin'])} ({conflit['date']}) "
             "— la mise à jour sera refusée tant qu'elle n'est pas résolue"
@@ -140,13 +153,29 @@ def auditer_commune(
     etape(f"lecture de {os.path.basename(fichier)}…")
     try:
         lecture = lire_audit(acces.lisible(fichier), colonne_id, colonnes, ligne_entete)
+    except FileNotFoundError as exc:      # mode URL : rien à cette adresse sur SharePoint
+        resultat.statut = StatutAudit.INTROUVABLE
+        resultat.message = str(exc)
+        resultat.duree = time.perf_counter() - depart
+        return resultat
     except Exception as exc:  # noqa: BLE001 — l'échec d'une commune est isolé
         resultat.statut = StatutAudit.ERREUR
         resultat.message = str(exc) or exc.__class__.__name__
         resultat.duree = time.perf_counter() - depart
         return resultat
 
-    resultat.ids = regrouper_par_id(controler(lecture.lignes, colonnes))
+    lignes = lecture.lignes
+    if resultat.ids_demandes is not None:
+        voulus = set(resultat.ids_demandes)
+        lignes = [l for l in lignes if normaliser_id(l.id_erreur) in voulus]
+        trouves = {normaliser_id(l.id_erreur) for l in lignes}
+        resultat.ids_introuvables = [i for i in resultat.ids_demandes if i not in trouves]
+        if resultat.ids_introuvables:
+            resultat.avertissements.append(
+                f"{len(resultat.ids_introuvables)} ID erreur introuvable(s) dans le fichier : "
+                + ", ".join(resultat.ids_introuvables)
+            )
+    resultat.ids = regrouper_par_id(controler(lignes, colonnes))
     resultat.avertissements.extend(lecture.avertissements)
     resultat.nb_lignes_lues = lecture.nb_lignes_lues
     resultat.duree = time.perf_counter() - depart

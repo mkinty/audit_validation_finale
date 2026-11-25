@@ -38,6 +38,8 @@ complete_excel_files**. Chacun est couvert par
 | 10 | Une exception levée sur le fil Excel garde dans sa trace les variables locales, dont `classeur`, `feuille` et les cellules. Elle forme un cycle que le ramasse-miettes libère plus tard **depuis n'importe quel thread**, parfois le fil Excel neuf en pleine écriture. Les appels en cours sont alors perturbés : feuille « à moitié initialisée », `AttributeError: <unknown>.Cells`, « Invalid number of arguments ». Le problème est reproductible en enchaînant les tests de `tests/moteur_sna`. | `_liberer_objets_com` vide ces cadres sur le fil Excel lui-même, avant de transmettre l'exception. Le type et le message sont conservés. |
 | 11 | *(ajout, audit depuis SharePoint)* | `SessionExcel.copier_version_serveur(adresse, destination)` ouvre un classeur par son URL SharePoint en lecture seule, puis l'enregistre en copie locale (`SaveCopyAs`). Il passe par les mêmes reprises et le même garde-fou que `appliquer_regles` : la boucle de reprises est factorisée dans `_avec_reprises`. |
 
+| 12 | *(ajout)* L'ouverture d'un fichier SharePoint peut afficher la **fenêtre de connexion Microsoft 365** (classe `BasicEmbeddedBrowser`). Dans une instance invisible, l'appel reste bloqué jusqu'au délai anti-blocage, trois fois de suite : 6 minutes pour un fichier, constatées sur un vrai SharePoint. | Le garde-fou détecte cette fenêtre en moins de 2 s et lève `ConnexionRequise`. Avec `SessionExcel(connexion_interactive=True)`, le fichier est ouvert une fois dans un Excel **visible** pour que l'utilisateur se connecte, puis le travail reprend. Sans cette option, un message explique quoi faire. Une adresse `https://` est ouverte en mode « co-édition SharePoint ». |
+
 ### `services/onedrive.py`
 
 - *(ajout, audit depuis SharePoint)* `url_sharepoint` convertit aussi un chemin WebDAV
@@ -53,6 +55,9 @@ complete_excel_files**. Chacun est couvert par
     parallèle, tandis que l'écriture reste une à une dans la session unique.
 - `doit_arreter` (par défaut `None`) permet d'interrompre un lot entre deux
   communes. Une commune commencée va à son terme.
+- `localiser` et `conflits` (par défaut `trouver_fichier_audit` et
+  `detecter_fichiers_conflit`) : un fichier peut être désigné par son adresse
+  SharePoint quand le dossier ne peut pas être parcouru.
 - `prereperage` (par défaut `True` : comportement d'origine). Avec `False`, Excel est
   toujours ouvert, sans vérifier d'abord la présence des ID dans le fichier parcouru.
   C'est nécessaire quand ce fichier est une copie locale qui peut différer du serveur.

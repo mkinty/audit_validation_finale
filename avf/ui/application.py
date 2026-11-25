@@ -5,7 +5,8 @@ Déroulé, de haut en bas :
     1. dossier racine : dossier local (parcourir), ou lien SharePoint du dossier
        racine — l'audit lit alors la version serveur des fichiers ;
     2. communes — toutes celles de ``<racine>/Dep<XX>/<commune>`` détectées,
-       ou codes INSEE renseignés (le dossier ``Dep<XX>`` en est déduit) ;
+       codes INSEE renseignés (le dossier ``Dep<XX>`` en est déduit), ou
+       seulement des ID erreur (``13001_2``…) : l'audit ne contrôle que leurs lignes ;
     3. audit des 4 colonnes de chaque ligne (threads de fond, journal en temps réel),
        rapport en popup, export HTML / Excel / CSV ;
     4. mise à jour des ID non valides — moteur et règles de
@@ -37,8 +38,9 @@ from sna.ui.theme import STYLE_STATUT, Couleurs, Polices
 from .. import chemins
 from ..config import Parametres, charger, enregistrer
 from ..models.audit import AuditCommune, RapportAudit
-from ..models.source import EXCEL, LOCAL, SourceAudit
+from ..models.source import EXCEL, LOCAL, URL, SourceAudit
 from ..services import detection, sharepoint
+from sna.services.identifiants import grouper_par_commune
 from ..services.audit import auditer_communes
 from ..services.export import FORMATS, exporter, nom_fichier_defaut, ouvrir_dans_navigateur, ouvrir_fichier
 from ..services.mise_a_jour import (
@@ -46,7 +48,7 @@ from ..services.mise_a_jour import (
 )
 from ..views import presentation as p
 from .composants import (
-    DialogueColonnes, DialogueSaisie, bouton, carte, case, champ, configurer_styles,
+    DialogueColonnes, DialogueSaisie, ZoneDefilante, bouton, carte, case, champ, configurer_styles,
 )
 from .fenetre_rapport import FenetreRapport
 
@@ -69,8 +71,9 @@ class Application(tk.Tk):
         self._excel = excel_disponible()
 
         self.title("Audit de la Validation finale — Projet SNA")
-        self.geometry("1100x940")
-        self.minsize(960, 780)
+        hauteur = min(940, max(self.winfo_screenheight() - 90, 480))
+        self.geometry(f"1100x{hauteur}")
+        self.minsize(760, 420)
         self.configure(bg=Couleurs.FOND)
         configurer_styles(self)
 
@@ -78,6 +81,7 @@ class Application(tk.Tk):
         self.var_source = tk.StringVar(value=self.params.source)
         self.var_lien = tk.StringVar(value=self.params.lien_sharepoint)
         self._source_sp: SourceAudit | None = None   # accès SharePoint établi
+        self.ids_cibles: dict[str, list[str]] = {}    # audit restreint à ces ID erreur ({} : communes entières)
         self.var_simulation = tk.BooleanVar(value=False)
         self.var_date_du_jour = tk.BooleanVar(value=self.params.date_du_jour)
         self.var_excel = tk.BooleanVar(value=self.params.ecrire_via_excel and self._excel)
@@ -100,7 +104,10 @@ class Application(tk.Tk):
         tk.Label(entete, text="<racine>/Dep<XX>/<commune>/audit_*.xlsx  ", font=Polices.MONO,
                  bg=Couleurs.FOND_HEADER, fg=Couleurs.TEXTE_SECONDAIRE).pack(side="right")
 
-        corps = tk.Frame(self, bg=Couleurs.FOND)
+        # Tout le contenu défile : sur un petit écran, aucune étape n'est hors d'atteinte.
+        self.zone = ZoneDefilante(self, bg=Couleurs.FOND)
+        self.zone.pack(fill="both", expand=True)
+        corps = tk.Frame(self.zone.interieur, bg=Couleurs.FOND)
         corps.pack(fill="both", expand=True, padx=16, pady=10)
 
         self._construire_racine(corps)
@@ -153,6 +160,14 @@ class Application(tk.Tk):
         self.btn_det_com.pack(side="left")
         self.btn_saisie_com = bouton(boutons, "✏️ Renseigner…", self._renseigner_communes)
         self.btn_saisie_com.pack(side="left", padx=6)
+        self.btn_saisie_ids = bouton(boutons, "🎯 ID erreur…", self._renseigner_ids)
+        self.btn_saisie_ids.pack(side="left")
+        self.cadre_perimetre = tk.Frame(c.interieur, bg=Couleurs.FOND_CARTE)
+        self.lbl_perimetre = tk.Label(self.cadre_perimetre, text="", bg=Couleurs.FOND_CARTE, fg=Couleurs.INFO,
+                                      font=Polices.PETIT, anchor="w", justify="left", wraplength=820)
+        self.lbl_perimetre.pack(side="left", fill="x", expand=True)
+        self.btn_effacer_ids = bouton(self.cadre_perimetre, "✖ Communes entières", self._effacer_ids, "discret")
+        self.btn_effacer_ids.pack(side="right")
         self.liste_com = self._liste(c.interieur, colonnes=4)
         self.liste_com.bind("<<ListboxSelect>>", lambda e: (self._sauver_selection(), self._maj_etat()))
         self.lbl_com = self._ligne_selection(c.interieur, self.liste_com)
@@ -214,7 +229,7 @@ class Application(tk.Tk):
         haut.pack(fill="x")
         bouton(haut, "⚙️ Réglage des valeurs (règles)", self._ouvrir_regles).pack(side="left")
         bouton(haut, "↺ Valeurs par défaut", self._regles_par_defaut, "discret").pack(side="left", padx=6)
-        self.btn_maj = bouton(haut, "🛠️  Mettre à jour les ID sans Validation finale",
+        self.btn_maj = bouton(haut, "🛠️  Mettre à jour les ID non valides",
                               lambda: self._lancer_mise_a_jour(None), "alerte", padx=16, pady=6)
         self.btn_maj.pack(side="right")
 
@@ -294,6 +309,11 @@ class Application(tk.Tk):
             else:
                 s = self._source_sp
                 texte = f"✅ Connecté — {s.libelle}\n   {s.racine}"
+                if s.diagnostic:
+                    texte += f"\n   Accès direct impossible : {s.diagnostic}"
+                if s.mode == URL:
+                    texte += ("\n   Le dossier ne peut pas être parcouru : renseignez les communes ou les "
+                              "ID erreur (étape 2). Chaque fichier est ouvert sur le serveur par Excel.")
                 if s.mode == EXCEL:
                     texte += "\n   (WebDAV refusé : chaque fichier est ouvert sur le serveur par Excel — plus lent)"
                 couleur = Couleurs.SUCCES
@@ -388,9 +408,21 @@ class Application(tk.Tk):
         return False
 
     # ══ Communes ══════════════════════════════════════════════════
+    def _existe(self, dossier: str) -> bool:
+        """Un dossier de commune existe-t-il ? Sans parcours possible (mode URL), on ne peut
+        pas le vérifier : la commune est retenue, son fichier sera cherché à son adresse."""
+        source = self._source()
+        return True if source is not None and not source.listable else os.path.isdir(dossier)
+
     def _detecter_communes(self) -> None:
         if not self._verifier_racine():
             return
+        if not self._source().listable:
+            messagebox.showinfo(
+                "Communes", "Le dossier SharePoint ne peut pas être parcouru dans ce mode d'accès : "
+                "renseignez les communes (✏️) ou les ID erreur (🎯).", parent=self)
+            return
+        self._effacer_ids(silencieux=True)
         communes = detection.lister_communes(self._racine())
         if not communes:
             messagebox.showinfo("Communes", "Aucune commune trouvée sous la racine "
@@ -414,7 +446,8 @@ class Application(tk.Tk):
         ).montrer()
         if texte is None:
             return
-        verif = detection.verifier_communes(self._racine(), detection.parser_communes(texte))
+        self._effacer_ids(silencieux=True)
+        verif = detection.verifier_communes(self._racine(), detection.parser_communes(texte), self._existe)
         if verif.absentes:
             messagebox.showwarning(
                 "Communes introuvables",
@@ -423,6 +456,68 @@ class Application(tk.Tk):
         self._remplir_communes(verif.trouvees, selection=[c.code for c in verif.trouvees])
         if verif.trouvees:
             self.journaliser(f"✏️ {len(verif.trouvees)} commune(s) renseignée(s)", Couleurs.INFO)
+
+    # ── Audit restreint à des ID erreur ───────────────────────────
+    def _renseigner_ids(self) -> None:
+        if not self._verifier_racine():
+            return
+        texte = DialogueSaisie(
+            self, "Auditer seulement des ID erreur",
+            "Collez les ID erreur à auditer (séparés par des virgules, espaces ou retours à la "
+            "ligne). La commune et son dossier Dep<XX> sont déduits du code INSEE en préfixe ; "
+            "seules les lignes de ces ID sont contrôlées.",
+            "13001_2, 13001_15  2A004_1",
+            texte="\n".join(self.params.ids_cibles),
+        ).montrer()
+        if texte is None:
+            return
+        saisie = detection.verifier_ids(self._racine(), texte, self._existe)
+        problemes = []
+        if saisie.absents:
+            problemes.append("Communes sans dossier <racine>/Dep<XX>/<commune> — ces ID sont ignorés :\n"
+                             + "\n".join(f"  {c} : {', '.join(ids)}" for c, ids in saisie.absents.items()))
+        if saisie.codes_sans_id:
+            problemes.append("Codes INSEE saisis sans numéro d'ID (format <insee>_<numéro>) — ignorés :\n  "
+                             + ", ".join(saisie.codes_sans_id))
+        if problemes:
+            messagebox.showwarning("ID erreur", "\n\n".join(problemes), parent=self)
+        if not saisie.groupes:
+            messagebox.showinfo("ID erreur", "Aucun ID erreur exploitable (format attendu : 13001_2).",
+                                parent=self)
+            return
+        self.ids_cibles = saisie.groupes
+        self.params.ids_cibles = saisie.ids
+        self._remplir_communes(saisie.trouvees, selection=list(saisie.groupes))
+        self._maj_perimetre()
+        self.journaliser(f"🎯 {saisie.nb_ids} ID erreur saisi(s) sur {len(saisie.groupes)} commune(s) — "
+                         "seules leurs lignes seront auditées", Couleurs.INFO)
+
+    def _effacer_ids(self, silencieux: bool = False) -> None:
+        """Revient à l'audit des communes entières."""
+        if not self.ids_cibles and not self.params.ids_cibles:
+            return
+        self.ids_cibles = {}
+        self.params.ids_cibles = []
+        self._sauver()
+        self._maj_perimetre()
+        if not silencieux:
+            self.journaliser("🗂 Audit des communes entières (ID erreur saisis oubliés)", Couleurs.INFO)
+
+    def _maj_perimetre(self) -> None:
+        if not self.ids_cibles:
+            self.cadre_perimetre.pack_forget()
+            return
+        ids = [i for v in self.ids_cibles.values() for i in v]
+        apercu = ", ".join(ids[:10]) + (f"… (+{len(ids) - 10})" if len(ids) > 10 else "")
+        self.lbl_perimetre.config(
+            text=f"🎯 Audit limité à {len(ids)} ID erreur sur {len(self.ids_cibles)} commune(s) : {apercu}")
+        self.cadre_perimetre.pack(fill="x", pady=(6, 0), after=self.btn_det_com.master)
+
+    def _ids_pour(self, communes: list[str]) -> dict[str, list[str]] | None:
+        """ID erreur à auditer par commune, ou ``None`` pour les communes entières."""
+        if not self.ids_cibles:
+            return None
+        return {c: self.ids_cibles[c] for c in communes if c in self.ids_cibles}
 
     def _remplir_communes(self, communes, selection: list[str] | None = None) -> None:
         self._remplir(self.liste_com, [
@@ -462,9 +557,19 @@ class Application(tk.Tk):
 
     def _restaurer_selection(self) -> None:
         """Recharge les communes sélectionnées au dernier lancement (si elles existent toujours)."""
-        if not self._racine_ok() or not self.params.communes:
+        if not self._racine_ok():
             return
-        verif = detection.verifier_communes(self._racine(), self.params.communes)
+        if self.params.ids_cibles:                 # audit restreint à des ID erreur
+            groupes = grouper_par_commune(self.params.ids_cibles)
+            verif = detection.verifier_communes(self._racine(), list(groupes), self._existe)
+            self.ids_cibles = {c.code: groupes[c.code] for c in verif.trouvees}
+            voulues = [c for c in self.params.communes if c in self.ids_cibles] or list(self.ids_cibles)
+            self._remplir_communes(verif.trouvees, selection=voulues)
+            self._maj_perimetre()
+            return
+        if not self.params.communes:
+            return
+        verif = detection.verifier_communes(self._racine(), self.params.communes, self._existe)
         self._remplir_communes(verif.trouvees)
 
     # ══ Audit ═════════════════════════════════════════════════════
@@ -480,19 +585,23 @@ class Application(tk.Tk):
         if apres is None:
             self._vider_journal_ui()
         source = self._source()
+        ids = self._ids_pour(communes)
         self.journaliser(f"🚀 Audit de {len(communes)} commune(s)", Couleurs.INFO)
+        if ids is not None:
+            self.journaliser(f"🎯 Limité à {sum(len(v) for v in ids.values())} ID erreur saisi(s)",
+                             Couleurs.INFO)
         self.journaliser(f"🗂 Source : {source.libelle} — {source.affichage}", Couleurs.TEXTE_SECONDAIRE)
         self.journaliser(
             f"🔎 Ligne validée si : {' · '.join(p.libelles_criteres(self.params.colonnes).values())}"
             f" (ID dans « {self.params.regles.colonne_id} »)", Couleurs.TEXTE_SECONDAIRE)
         self.journaliser(SEPARATEUR, Couleurs.SEPARATEUR)
         params = self.params
-        threading.Thread(target=self._executer_audit, args=(communes, source, params, apres),
+        threading.Thread(target=self._executer_audit, args=(communes, source, params, apres, ids),
                          daemon=True).start()
 
-    def _executer_audit(self, communes, source: SourceAudit, params: Parametres, apres) -> None:
+    def _executer_audit(self, communes, source: SourceAudit, params: Parametres, apres, ids=None) -> None:
         try:
-            if source.mode == EXCEL and not excel_disponible():
+            if source.mode in (EXCEL, URL) and not excel_disponible():
                 raise ExcelIndisponible("Excel est nécessaire pour lire les fichiers sur le serveur "
                                         "(WebDAV refusé)")
             with sharepoint.acces_pour(source) as acces:
@@ -503,7 +612,7 @@ class Application(tk.Tk):
                     on_resultat=lambda r: self.journaliser(*_ligne_audit(r)),
                     doit_arreter=self._arret.is_set,
                     paralleles=params.paralleles,
-                    source=source, acces=acces,
+                    source=source, acces=acces, ids=ids,
                 )
         except Exception as exc:  # noqa: BLE001 — filet de sécurité
             self.journaliser(f"❌ Audit interrompu : {exc}", Couleurs.ERREUR)
@@ -789,8 +898,11 @@ class Application(tk.Tk):
         def etat(condition: bool) -> str:
             return "normal" if condition and libre else "disabled"
 
-        self.btn_det_com.config(state=etat(racine_ok))
+        source = self._source()
+        self.btn_det_com.config(state=etat(racine_ok and (source is None or source.listable)))
         self.btn_saisie_com.config(state=etat(racine_ok))
+        self.btn_saisie_ids.config(state=etat(racine_ok))
+        self.btn_effacer_ids.config(state=etat(True))
         self.btn_audit.config(state=etat(racine_ok and nb_com_sel > 0))
         self.btn_arret.config(state="normal" if self.occupe else "disabled")
         a_rapport = self.rapport is not None

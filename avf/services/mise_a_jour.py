@@ -38,7 +38,7 @@ from sna.services.excel_com import SessionExcel, excel_disponible
 from sna.services.traitement import traiter_communes
 
 from ..models.audit import RapportAudit
-from ..models.source import EXCEL, SourceAudit
+from ..models.source import EXCEL, URL, SourceAudit
 
 
 @dataclass
@@ -163,7 +163,11 @@ def mettre_a_jour(
             )
         via_excel = True
     ecrire_via_excel = via_excel and not simuler and _excel_disponible(session_factory)
-    contexte = session_factory() if ecrire_via_excel else nullcontext()
+    if session_factory is SessionExcel:
+        # Si Office demande la connexion Microsoft 365, la montrer plutôt qu'échouer.
+        contexte = SessionExcel(connexion_interactive=True) if ecrire_via_excel else nullcontext()
+    else:
+        contexte = session_factory() if ecrire_via_excel else nullcontext()
 
     with contexte as session:
         resultats = traiter_communes(
@@ -171,7 +175,10 @@ def mettre_a_jour(
             on_progression=on_progression, on_resultat=on_resultat, on_etape=on_etape,
             session_excel=session if ecrire_via_excel else None,
             paralleles=paralleles, doit_arreter=doit_arreter,
-            prereperage=not (source is not None and source.mode == EXCEL),
+            prereperage=not (source is not None and source.mode in (EXCEL, URL)),
+            localiser=(lambda racine, commune: source.url_fichier(commune))
+            if source is not None and source.mode == URL else None,
+            conflits=(lambda racine, commune: []) if source is not None and source.mode == URL else None,
         )
 
     echecs, reussis = attente.calculer_echecs_et_reussites(groupes, resultats)

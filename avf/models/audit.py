@@ -120,6 +120,10 @@ class AuditCommune:
     avertissements: list[str] = field(default_factory=list)
     nb_lignes_lues: int = 0
     duree: float = 0.0
+    # Audit restreint à des ID erreur saisis : ceux demandés pour la commune
+    # (``None`` : toute la commune), et ceux absents du fichier.
+    ids_demandes: list[str] | None = None
+    ids_introuvables: list[str] = field(default_factory=list)
 
     # ── Lignes ────────────────────────────────────────────────────
     @property
@@ -203,6 +207,20 @@ class RapportAudit:
     date: datetime = field(default_factory=datetime.now)
     duree: float = 0.0
     source: SourceAudit | None = None   # None : dossier local (rapports antérieurs, tests)
+
+    # ── Périmètre : communes entières, ou ID erreur saisis ────────
+    @property
+    def par_ids(self) -> bool:
+        """Vrai si l'audit est restreint à des ID erreur saisis."""
+        return any(c.ids_demandes is not None for c in self.communes)
+
+    @property
+    def nb_ids_demandes(self) -> int:
+        return sum(len(c.ids_demandes or []) for c in self.communes)
+
+    def ids_introuvables(self) -> list[str]:
+        """ID erreur saisis absents de leur fichier (ou dont la commune n'a pas pu être lue)."""
+        return [i for c in self.communes for i in (c.ids_introuvables if c.lisible else c.ids_demandes or [])]
 
     @property
     def libelle_source(self) -> str:

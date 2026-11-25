@@ -115,6 +115,69 @@ def champ(parent, variable: tk.StringVar, **options) -> tk.Entry:
     )
 
 
+class ZoneDefilante(tk.Frame):
+    """Cadre au contenu défilant verticalement (petits écrans).
+
+    Placer les widgets dans :attr:`interieur`. Le contenu prend toute la largeur ;
+    en hauteur, il occupe au moins la zone visible (un widget en ``expand=True``
+    s'étire donc comme avant sur un grand écran) et défile quand il ne tient pas.
+    La barre de défilement n'apparaît que si elle sert. La molette fait défiler
+    la page, sauf au-dessus d'une zone qui défile elle-même (journal, listes,
+    tableaux) tant que celle-ci peut encore défiler.
+    """
+
+    def __init__(self, parent, bg: str = Couleurs.FOND, **options):
+        super().__init__(parent, bg=bg, **options)
+        self.canvas = tk.Canvas(self, bg=bg, highlightthickness=0, bd=0)
+        self.barre = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=self._defilement)
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.interieur = tk.Frame(self.canvas, bg=bg)
+        self._fenetre = self.canvas.create_window(0, 0, window=self.interieur, anchor="nw")
+        self.interieur.bind("<Configure>", lambda e: self._ajuster())
+        self.canvas.bind("<Configure>", lambda e: self._ajuster())
+        self.bind_all("<MouseWheel>", self._molette, add="+")
+
+    def _ajuster(self) -> None:
+        largeur = self.canvas.winfo_width()
+        hauteur = max(self.interieur.winfo_reqheight(), self.canvas.winfo_height())
+        self.canvas.itemconfigure(self._fenetre, width=largeur, height=hauteur)
+        self.canvas.configure(scrollregion=(0, 0, largeur, hauteur))
+
+    def _defilement(self, debut: str, fin: str) -> None:
+        self.barre.set(debut, fin)
+        utile = (float(debut), float(fin)) != (0.0, 1.0)
+        if utile and not self.barre.winfo_ismapped():
+            self.barre.pack(side="right", fill="y", before=self.canvas)
+        elif not utile and self.barre.winfo_ismapped():
+            self.barre.pack_forget()
+
+    def defile(self) -> bool:
+        """Vrai si le contenu dépasse la zone visible."""
+        return self.canvas.yview() != (0.0, 1.0)
+
+    def _molette(self, event) -> str | None:
+        widget = event.widget
+        if not isinstance(widget, tk.Misc) or not str(widget).startswith(str(self)):
+            return None                       # autre fenêtre (popup du rapport…)
+        if not self.defile():
+            return None
+        if isinstance(widget, (tk.Text, tk.Listbox, ttk.Treeview)):
+            debut, fin = widget.yview()
+            vers_le_bas = event.delta < 0
+            if (vers_le_bas and fin < 1.0) or (not vers_le_bas and debut > 0.0):
+                return None                   # la zone défile elle-même
+        self.canvas.yview_scroll(int(-event.delta / 120) or (-1 if event.delta > 0 else 1), "units")
+        return "break"
+
+    def voir(self, widget) -> None:
+        """Fait défiler pour rendre ``widget`` visible."""
+        self.update_idletasks()
+        haut = widget.winfo_rooty() - self.interieur.winfo_rooty()
+        total = max(self.interieur.winfo_height(), 1)
+        self.canvas.yview_moveto(max(haut - 20, 0) / total)
+
+
 class BarreSegmentee(tk.Canvas):
     """Barre fine validé / non valide (même lecture que dans le rapport HTML)."""
 

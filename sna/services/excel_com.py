@@ -123,6 +123,48 @@ class ExcelBloque(Exception):
     répond pas »). Le processus de cette session est tué et un neuf est relancé."""
 
 
+class ConnexionRequise(ExcelBloque):
+    """Excel affiche la fenêtre de connexion Microsoft 365 (compte professionnel).
+
+    Dans une instance invisible, personne ne peut y répondre : sans cette
+    détection, l'ouverture d'un fichier SharePoint resterait bloquée jusqu'au
+    délai anti-blocage, à chaque tentative. Ajout de la copie vendorisée.
+    """
+
+
+# Classes de fenêtre de la connexion Microsoft 365 ouverte par Office (WebView de
+# l'authentification « moderne »). Leur apparition pendant un appel = connexion demandée.
+_CLASSES_CONNEXION = {"BasicEmbeddedBrowser"}
+
+
+def fenetre_connexion(pid: int | None) -> bool:
+    """Vrai si le processus ``pid`` affiche une fenêtre de connexion Microsoft 365."""
+    if not pid:
+        return False
+    try:
+        import win32gui
+        import win32process
+    except ImportError:
+        return False
+    trouvee = []
+
+    def examiner(fenetre, _):
+        try:
+            if (win32process.GetWindowThreadProcessId(fenetre)[1] == pid
+                    and win32gui.GetClassName(fenetre) in _CLASSES_CONNEXION):
+                trouvee.append(fenetre)
+                return False
+        except Exception:  # noqa: BLE001
+            pass
+        return True
+
+    try:
+        win32gui.EnumWindows(examiner, None)
+    except Exception:  # noqa: BLE001 — EnumWindows « échoue » quand le rappel l'arrête
+        pass
+    return bool(trouvee)
+
+
 def excel_disponible() -> bool:
     """Vrai si pywin32 est installé et qu'Excel est enregistré sur le poste."""
     try:
@@ -626,10 +668,11 @@ class _FilExcel:
         """Le prochain appel peut légitimement durer ``delai_s`` (ouverture d'un classeur…)."""
         self._echeance = time.monotonic() + max(delai_s, self._delai_courant)
 
-    def executer(self, fonction: Callable[[], object], delai_s: float):
+    def executer(self, fonction: Callable[[], object], delai_s: float, detecter_connexion: bool = True):
         """Exécute ``fonction`` sur le fil Excel ; lève :class:`ExcelBloque` si
         elle ne donne aucun signe de vie pendant ``delai_s`` secondes (ou si
-        elle n'a pas pu démarrer dans ce délai)."""
+        elle n'a pas pu démarrer dans ce délai), et :class:`ConnexionRequise`
+        dès qu'Excel affiche la fenêtre de connexion Microsoft 365."""
         resultat: list = []
         erreur: list[BaseException] = []
         fini = threading.Event()
@@ -649,6 +692,7 @@ class _FilExcel:
                 fini.set()
 
         limite_demarrage = time.monotonic() + delai_s
+        prochain_controle = time.monotonic() + 1.0
         self._taches.put(tache)
         while not fini.wait(0.1):
             maintenant = time.monotonic()
@@ -656,6 +700,12 @@ class _FilExcel:
                 if maintenant > limite_demarrage:
                     raise ExcelBloque(f"le fil Excel n'a pas pris la tâche en {delai_s:.0f} s")
                 continue
+            if detecter_connexion and maintenant >= prochain_controle:
+                prochain_controle = maintenant + 1.0
+                if fenetre_connexion(self.pid):
+                    raise ConnexionRequise(
+                        "Excel demande une connexion à Microsoft 365 (compte professionnel)"
+                    )
             echeance = self._echeance
             if echeance is not None and maintenant > echeance:
                 raise ExcelBloque(
@@ -690,8 +740,13 @@ class SessionExcel:
     TENTATIVES = 3   # essais complets d'un classeur si Excel reste occupé, bloqué ou déconnecté
 
     def __init__(self, visible: bool = False, delai_occupe_s: float = 120, delai_blocage_s: float = 90,
-                 delai_ouverture_s: float = 180):
+                 delai_ouverture_s: float = 180, connexion_interactive: bool = False,
+                 delai_connexion_s: float = 300):
         self.visible = visible
+        # Fenêtre de connexion Microsoft 365 : la montrer (Excel visible) pour que
+        # l'utilisateur se connecte une fois, puis reprendre — plutôt qu'échouer.
+        self.connexion_interactive = connexion_interactive
+        self.delai_connexion_s = delai_connexion_s
         self.delai_occupe_s = delai_occupe_s
         self.delai_blocage_s = delai_blocage_s
         self.delai_ouverture_s = delai_ouverture_s
@@ -755,7 +810,7 @@ class SessionExcel:
         ids_erreur = list(ids_erreur)
         bilan, essai = self._avec_reprises(
             lambda fil, etape: self._appliquer_une_fois(fil, chemin_fichier, config, ids_erreur, etape),
-            on_etape,
+            on_etape, adresse=url_sharepoint(chemin_fichier) or chemin_fichier,
         )
         bilan.tentatives = essai
         return bilan
@@ -786,10 +841,46 @@ class SessionExcel:
                 except Exception:  # noqa: BLE001
                     pass
 
-        return self._avec_reprises(copier, on_etape)[0]
+        return self._avec_reprises(copier, on_etape, adresse=adresse)[0]
 
-    def _avec_reprises(self, travail: Callable[["_FilExcel", Etape], object], on_etape: Etape | None):
-        """Exécute ``travail(fil, etape)`` sur le fil Excel, avec reprises ; renvoie ``(résultat, essai)``."""
+    def _connexion_interactive(self, adresse: str, on_etape: Etape | None) -> None:
+        """Ouvre ``adresse`` dans un Excel **visible** pour que l'utilisateur se connecte.
+
+        Office mémorise la connexion (gestionnaire de comptes Windows) : les
+        instances invisibles suivantes ouvrent alors les fichiers sans rien demander.
+        """
+        _dire(on_etape, "🔑 Microsoft 365 demande une connexion : une fenêtre Excel s'ouvre — "
+                        "connectez-vous avec votre compte professionnel (elle se fermera ensuite)")
+        fil = _FilExcel(True, self.delai_occupe_s)
+        try:
+            def ouvrir() -> None:
+                try:
+                    fil.xl.WindowState = -4137   # xlMaximized, au premier plan
+                except Exception:  # noqa: BLE001
+                    pass
+                classeur = fil.xl.Workbooks.Open(adresse, 0, True)
+                classeur.Close(False)
+
+            fil.executer(ouvrir, delai_s=self.delai_connexion_s, detecter_connexion=False)
+            _dire(on_etape, "🔑 Connexion Microsoft 365 effectuée — reprise du traitement")
+        except ExcelBloque as exc:
+            raise ConnexionRequise(
+                f"connexion Microsoft 365 non effectuée en {self.delai_connexion_s:.0f} s"
+            ) from exc
+        finally:
+            if not _fil_libre(fil):          # connexion abandonnée : l'appel est encore en cours
+                _terminer_de_force(fil.pid)
+            fil.arreter_proprement()
+            _terminer_si_toujours_ouvert(fil.pid, attente_s=10)
+
+    def _avec_reprises(self, travail: Callable[["_FilExcel", Etape], object], on_etape: Etape | None,
+                       adresse: str | None = None):
+        """Exécute ``travail(fil, etape)`` sur le fil Excel, avec reprises ; renvoie ``(résultat, essai)``.
+
+        ``adresse`` : fichier ouvert par ``travail``, pour la connexion Microsoft 365
+        interactive si Excel la demande (cf. ``connexion_interactive``).
+        """
+        connexion_faite = False
         with self._verrou:
             for essai in range(1, self.TENTATIVES + 1):
                 if self._fil is None:
@@ -799,6 +890,15 @@ class SessionExcel:
                 try:
                     resultat = fil.executer(lambda f=fil, e=etape: travail(f, e), delai_s=self.delai_blocage_s)
                     return resultat, essai
+                except ConnexionRequise as exc:
+                    self._redemarrer(on_etape)      # l'instance invisible reste bloquée sur la fenêtre
+                    if not self.connexion_interactive or connexion_faite or not adresse:
+                        raise ConnexionRequise(
+                            f"{exc} — ouvrez une fois un fichier du site SharePoint dans Excel et "
+                            "connectez-vous avec votre compte professionnel, puis relancez"
+                        ) from None
+                    self._connexion_interactive(adresse, on_etape)
+                    connexion_faite = True
                 except ExcelBloque as exc:
                     _dire(on_etape, f"⛔ {exc}")
                     self._redemarrer(on_etape)
@@ -859,8 +959,10 @@ class SessionExcel:
     def _ouvrir(self, fil: _FilExcel, chemin: str):
         """Ouvre par l'adresse SharePoint si le fichier est synchronisé, sinon par le chemin local."""
         url = url_sharepoint(chemin)
+        local = "co-édition SharePoint" if chemin.lower().startswith(("http://", "https://")) else \
+            "fichier local OneDrive"
         erreur = None
-        for cible, mode in ((url, "co-édition SharePoint"), (chemin, "fichier local OneDrive")):
+        for cible, mode in ((url, "co-édition SharePoint"), (chemin, local)):
             if not cible:
                 continue
             fil.accorder(self.delai_ouverture_s)
@@ -1061,6 +1163,11 @@ class SessionExcel:
 
 
 # ── Helpers ────────────────────────────────────────────────────────
+def _fil_libre(fil: "_FilExcel") -> bool:
+    """Vrai si le fil Excel n'a aucune tâche en cours (échéance levée)."""
+    return fil._echeance is None
+
+
 def _liberer_objets_com(exc: BaseException | None) -> None:
     """Vide, ici sur le fil Excel, les variables locales des cadres de la trace de ``exc``.
 
