@@ -185,14 +185,18 @@ def _traiter_une_commune(
             on_etape(commune, message)
 
     etape("recherche du fichier audit…")
-    fichier = (localiser or trouver_fichier_audit)(racine, commune)
+    try:   # localiser / conflits fournis par l'appelant peuvent passer par le réseau
+        fichier = (localiser or trouver_fichier_audit)(racine, commune)
+        conflits = (conflits or detecter_fichiers_conflit)(racine, commune) if fichier else []
+    except Exception as exc:  # noqa: BLE001 — l'échec d'une commune est isolé
+        return ResultatCommune(commune, Statut.ERREUR, message=str(exc) or exc.__class__.__name__,
+                               nb_ids_demandes=len(ids))
     if fichier is None:
         return ResultatCommune(
             commune, Statut.INTROUVABLE,
             message="fichier introuvable", nb_ids_demandes=len(ids),
         )
 
-    conflits = (conflits or detecter_fichiers_conflit)(racine, commune)
     if conflits:
         detail = ", ".join(
             f"{os.path.basename(c['chemin'])} (conflit du {c['date']})" for c in conflits

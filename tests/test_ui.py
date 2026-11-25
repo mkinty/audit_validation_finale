@@ -29,6 +29,18 @@ def _tk_disponible() -> bool:
 pytestmark = pytest.mark.skipif(not _tk_disponible(), reason="pas d'affichage Tk")
 
 
+@pytest.fixture(autouse=True)
+def sans_vrai_navigateur(monkeypatch):
+    """Jamais de vrai navigateur lancé par les tests : la connexion utilise l'accès de
+    repli (``sharepoint.connecter``), sauf si un test simule le navigateur lui-même."""
+    from avf.services import sharepoint
+    monkeypatch.setattr(sharepoint, "navigateur_disponible", lambda: False)
+
+    def interdit(*a, **k):
+        raise AssertionError("un test a voulu lancer un vrai navigateur")
+    monkeypatch.setattr(sharepoint, "connecter_navigateur", interdit)
+
+
 @pytest.fixture
 def dialogues(monkeypatch):
     """Réponses automatiques aux boîtes de dialogue, et trace des messages."""
@@ -636,3 +648,57 @@ def test_molette_fait_defiler_la_page_sauf_sur_le_journal(app):
     app.txt_log.yview_moveto(0)
     assert app.zone._molette(Evenement(app.txt_log, -120)) is None    # le journal défile lui-même
     app.withdraw()
+
+
+# ── Connexion par le navigateur + API SharePoint ──────────────────
+from .test_sharepoint_api import LIEN as LIEN_API, client, serveur  # noqa: E402,F401  (fixtures)
+
+
+def test_connexion_navigateur_detection_et_audit_par_l_api(app, racine, client, monkeypatch):
+    from avf.models.source import API, SourceAudit
+    from avf.services import sharepoint
+    appels = {}
+
+    def connecter_navigateur(lien, on_etape=None, interactif=True):
+        appels["interactif"] = interactif
+        on_etape("🔑 identifiez-vous dans la fenêtre du navigateur")
+        sharepoint.enregistrer_client(client)
+        return SourceAudit(API, LIEN_API, LIEN_API)
+
+    monkeypatch.setattr(module_app.sharepoint, "navigateur_disponible", lambda: True)
+    monkeypatch.setattr(module_app.sharepoint, "connecter_navigateur", connecter_navigateur)
+    app.var_source.set("sharepoint")
+    app._changer_source()
+    app.var_lien.set(LIEN_API)
+    app._connecter_sharepoint()
+    attendre(app)
+    try:
+        assert appels == {"interactif": True}
+        assert "connexion par le navigateur" in app.lbl_source["text"]
+        assert "identifiez-vous" in app.txt_log.get("1.0", tk.END)
+        assert str(app.btn_det_com["state"]) == "normal"
+        app._detecter_communes()                     # par l'API, en arrière-plan
+        attendre(app)
+        assert app.liste_com.codes == ["13001", "13002", "13003", "2A004", "75020", "75021"]
+        app._lancer_audit()
+        attendre(app)
+        r = app.rapport
+        assert r.source.mode == API and r.nb_ids_non_valides == 7
+        assert r.commune("13001").chemin == LIEN_API + "/Dep13/13001/audit_13001.xlsx"
+        # Saisie d'ID : l'existence du dossier de commune est vérifiée par l'API
+        monkeypatch.setattr(DialogueSaisie, "montrer", lambda self: "13001_2 99999_1")
+        app._renseigner_ids()
+        assert app.liste_com.codes == ["13001"]
+    finally:
+        sharepoint._CLIENTS.clear()
+
+
+def test_oublier_la_connexion_sharepoint(app, monkeypatch, dialogues):
+    from avf.models.source import API, SourceAudit
+    oublis = []
+    monkeypatch.setattr(module_app.sharepoint, "oublier_connexion", lambda: oublis.append(1))
+    app.var_source.set("sharepoint")
+    app._changer_source()
+    app._source_sp = SourceAudit(API, LIEN, LIEN)
+    app._oublier_connexion()
+    assert oublis == [1] and app._source() is None and "Collez le lien" in app.lbl_source["text"]

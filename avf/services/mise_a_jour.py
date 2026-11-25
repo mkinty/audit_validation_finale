@@ -25,7 +25,7 @@ Ce module ne fait que trois choses en amont :
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass, field, replace
 from datetime import date
 import time
@@ -38,7 +38,7 @@ from sna.services.excel_com import SessionExcel, excel_disponible
 from sna.services.traitement import traiter_communes
 
 from ..models.audit import RapportAudit
-from ..models.source import EXCEL, URL, SourceAudit
+from ..models.source import API, EXCEL, URL, SourceAudit
 
 
 @dataclass
@@ -169,16 +169,33 @@ def mettre_a_jour(
     else:
         contexte = session_factory() if ecrire_via_excel else nullcontext()
 
-    with contexte as session:
+    # Dossier non parcourable localement : le fichier de chaque commune est désigné
+    # par son adresse SharePoint (trouvé par l'API, ou déduit du nommage).
+    # En simulation, rien n'est écrit : le décompte se fait sur une copie téléchargée
+    # de la version serveur (openpyxl ne lit pas une adresse https).
+    acces = None
+    localiser = None
+    pile = ExitStack()
+    if source is not None and source.mode in (URL, API):
+        from .sharepoint import acces_pour
+        acces = acces_pour(source)
+        localiser = acces.trouver
+        if simuler:
+            pile.enter_context(acces)
+
+            def localiser(racine_, commune):
+                adresse = acces.trouver(racine_, commune)
+                return acces.lisible(adresse) if adresse else None
+
+    with pile, contexte as session:
         resultats = traiter_communes(
             groupes, regles, racine, simuler=simuler,
             on_progression=on_progression, on_resultat=on_resultat, on_etape=on_etape,
             session_excel=session if ecrire_via_excel else None,
             paralleles=paralleles, doit_arreter=doit_arreter,
-            prereperage=not (source is not None and source.mode in (EXCEL, URL)),
-            localiser=(lambda racine, commune: source.url_fichier(commune))
-            if source is not None and source.mode == URL else None,
-            conflits=(lambda racine, commune: []) if source is not None and source.mode == URL else None,
+            prereperage=not (source is not None and source.mode in (EXCEL, URL, API)),
+            localiser=localiser,
+            conflits=acces.conflits if acces is not None else None,
         )
 
     echecs, reussis = attente.calculer_echecs_et_reussites(groupes, resultats)

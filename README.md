@@ -48,7 +48,42 @@ compris `…/Forms/AllItems.aspx?id=…`), un lien de partage `…/:f:/r/sites/�
 chemin `\\…@SSL\DavWWWRoot\…`. Un lien de partage opaque (`…/:f:/s/…/EaBc…`) ne
 contient pas le chemin du dossier : il est refusé, avec la marche à suivre.
 
-**Accès** : `🔗 Se connecter` cherche, dans l'ordre :
+### Se connecter avec le navigateur (accès principal)
+
+1. Collez le lien du dossier racine puis cliquez sur `🔗 Se connecter`.
+2. Une fenêtre **Microsoft Edge** s'ouvre sur le dossier (Google Chrome si Edge est
+   absent). Identifiez-vous normalement : compte professionnel, MFA… Cochez
+   « Rester connecté ».
+3. Dès que SharePoint vous ouvre le dossier, la fenêtre se ferme et l'outil est connecté
+   (« SharePoint — connexion par le navigateur »).
+
+L'outil interroge ensuite l'**API SharePoint** du site **avec votre identité** : liste des
+`Dep<XX>/<commune>`, présence des `audit_*.xlsx` et copies de conflit, puis
+téléchargement de chaque fichier audité. C'est la version du serveur, sans WebDAV, sans
+synchronisation et sans Excel, et plusieurs fichiers sont lus à la fois. L'API n'est
+utilisée qu'en **lecture**.
+
+- **Profil dédié** : Edge tourne sur un profil réservé à l'outil
+  (`%LOCALAPPDATA%\AuditValidationFinale\navigateur`), jamais sur le vôtre.
+- **Ce qui est conservé** : l'outil n'enregistre ni mot de passe ni cookie. La session
+  reste dans ce profil, chiffrée par Windows.
+- **Connexions suivantes** : au lancement de l'outil, ou au clic suivant sur « Se
+  connecter », la connexion se refait **sans fenêtre** tant que la session SharePoint est
+  valide.
+- **Communication avec Edge** : elle passe par son protocole de débogage, ouvert
+  uniquement en local (127.0.0.1).
+- `🚪 Oublier` efface la session et le profil, pour changer de compte par exemple.
+- **Session expirée pendant un audit** : les communes concernées sont signalées en
+  erreur. Il suffit de cliquer de nouveau sur « Se connecter ».
+
+**Mise à jour** : elle écrit toujours via Excel (co-édition). Le fichier de chaque
+commune est trouvé par l'API, puis ouvert par son adresse SharePoint. Si Excel demande à
+son tour la connexion Microsoft 365, voir plus bas. La **simulation** compte les
+modifications sur une copie téléchargée de la version serveur.
+
+### Accès de repli (sans navigateur)
+
+Si ni Edge ni Chrome ne sont installés, `🔗 Se connecter` cherche, dans l'ordre :
 
 | Mode | Comment | Conditions |
 |---|---|---|
@@ -56,7 +91,7 @@ contient pas le chemin du dossier : il est refusé, avec la marche à suivre.
 | **Via Excel, bibliothèque synchronisée** (1er repli) | Les communes sont listées depuis la bibliothèque **synchronisée par OneDrive**. Chaque `audit_*.xlsx` est ensuite **ouvert par son adresse SharePoint** dans l'instance Excel dédiée (lecture seule, compte Office), copié dans un dossier temporaire puis lu. Le contenu audité est donc celui du serveur. | Bibliothèque synchronisée sur le poste ; Excel installé. Plus lent : une ouverture Excel par commune. |
 | **Via Excel, sans synchronisation** (2e repli) | Le dossier ne peut pas être parcouru : on renseigne les communes (`✏️`) ou les ID erreur (`🎯`), et « Détecter toutes les communes » est désactivé. Le fichier de chaque commune est ouvert à l'adresse `<lien>/Dep<XX>/<commune>/audit_<commune>.xlsx`. Une adresse vide donne « Fichier introuvable ». Les copies de conflit ne sont pas détectables dans ce mode. | Excel installé. |
 
-**Erreur 224 « Accès refusé… sites approuvés »** : Windows n'a pas de session
+**Erreur 224 « Accès refusé… sites approuvés »** (accès de repli) : Windows n'a pas de session
 SharePoint pour l'accès direct. Depuis la fin d'Internet Explorer, Edge ne lui transmet
 plus la connexion. L'outil passe alors à un repli et affiche la cause. Pour rétablir
 l'accès direct, ouvrez le dossier dans SharePoint avec Edge puis cliquez sur « Afficher
@@ -315,10 +350,10 @@ audit_validation_finale/
 .venv\Scripts\python -m pytest
 ```
 
-482 tests : détection, lecture (chemin rapide et repli openpyxl comparés),
+503 tests : détection, lecture (chemin rapide et repli openpyxl comparés),
 critères de validité (dates en texte, casse, valeurs acceptées), audit par ligne et par
 ID, rapport HTML (structure, échappement, données de copie par catégorie), exports
-Excel et CSV, audit limité à des ID erreur saisis, source SharePoint (formats de lien, WebDAV, bibliothèque synchronisée,
+Excel et CSV, audit limité à des ID erreur saisis, connexion SharePoint par le navigateur et API (faux serveur SharePoint local), source SharePoint (formats de lien, WebDAV, bibliothèque synchronisée,
 lecture de la version serveur, connexion lente ou refusée, mise à jour forcée via Excel),
 configuration,
 mise à jour de bout en bout (valeurs écrites cellule par cellule, simulation,

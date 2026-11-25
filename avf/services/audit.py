@@ -137,14 +137,20 @@ def auditer_commune(
 
     depart = time.perf_counter()
     etape("recherche du fichier audit…")
-    fichier = acces.trouver(racine, code)
+    try:   # en source SharePoint, la recherche passe par le réseau : elle peut échouer
+        fichier = acces.trouver(racine, code)
+        conflits = acces.conflits(racine, code) if fichier is not None else []
+    except Exception as exc:  # noqa: BLE001 — l'échec d'une commune est isolé
+        resultat.statut = StatutAudit.ERREUR
+        resultat.message = str(exc) or exc.__class__.__name__
+        return resultat
     if fichier is None:
         resultat.statut = StatutAudit.INTROUVABLE
         resultat.message = "aucun fichier audit_*.xlsx dans le dossier de la commune"
         return resultat
     resultat.chemin = acces.adresse(fichier)
 
-    for conflit in acces.conflits(racine, code):
+    for conflit in conflits:
         resultat.avertissements.append(
             f"copie en conflit : {os.path.basename(conflit['chemin'])} ({conflit['date']}) "
             "— la mise à jour sera refusée tant qu'elle n'est pas résolue"

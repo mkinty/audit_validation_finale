@@ -6,7 +6,17 @@ atteindre SharePoint (conflit de synchronisation, copie « -NOMDUPC », envoi en
 ne voit. Ici, l'utilisateur colle le lien SharePoint du dossier racine et
 l'audit lit ce que contient réellement le serveur.
 
-Trois accès, sans inscription d'application ni droits d'administrateur :
+Accès principal — ``api`` : connexion par le navigateur
+    « Se connecter » ouvre Microsoft Edge (profil dédié à l'outil) sur le
+    dossier : l'utilisateur s'y identifie normalement (MFA comprise). La
+    session obtenue sert ensuite à interroger l'**API SharePoint** du site
+    (``services.sharepoint_rest``) : liste des ``Dep<XX>/<commune>``,
+    téléchargement de chaque ``audit_*.xlsx`` — la version du serveur, sans
+    WebDAV, sans synchronisation, sans Excel. Le profil étant conservé, la
+    connexion suivante est silencieuse tant que la session SharePoint est valide.
+
+Si aucun navigateur n'est disponible, trois accès de repli, sans inscription
+d'application ni droits d'administrateur :
 
 ``webdav`` — accès direct (préféré)
     Le lien devient un chemin réseau WebDAV ``\\\\hôte@SSL\\DavWWWRoot\\…``,
@@ -47,12 +57,17 @@ import re
 import shutil
 import tempfile
 import threading
+import time
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from sna.services.fichiers import detecter_fichiers_conflit, trouver_fichier_audit
 from sna.services.onedrive import montages_onedrive, url_sharepoint
 
-from ..models.source import EXCEL, URL, WEBDAV, SourceAudit
+from ..models.source import API, EXCEL, URL, WEBDAV, SourceAudit
+from . import sharepoint_rest as rest
+from .navigateur import (
+    NavigateurFerme, NavigateurIndisponible, NavigateurPilote, cookies_pour, trouver_navigateur,
+)
 
 _RACINE_WEBDAV = re.compile(r"^\\\\(?P<hote>[^\\@]+)@SSL(?:@\d+)?\\DavWWWRoot(?P<chemin>\\.*)?$", re.I)
 # Liens de partage : https://hote/:f:/r/sites/X/... (« r » = chemin réel, résoluble)
@@ -163,7 +178,116 @@ def dossier_synchronise(lien: LienSharePoint, montages: list[tuple[str, str]] | 
     return os.path.join(meilleur[0], *relatif.split("/")) if relatif else meilleur[0]
 
 
-# ── Connexion ─────────────────────────────────────────────────────
+# ── Connexion par le navigateur (accès principal) ─────────────────
+_CLIENTS: dict[str, rest.ClientSharePoint] = {}   # session établie, par hôte SharePoint
+_VERROU_CLIENTS = threading.Lock()
+
+
+def client_pour(lien: str) -> rest.ClientSharePoint:
+    """Client de l'API SharePoint ouvert par :func:`connecter_navigateur` pour ce lien."""
+    hote = (urlsplit(lien).hostname or "").lower()
+    with _VERROU_CLIENTS:
+        client = _CLIENTS.get(hote)
+    if client is None:
+        raise rest.AuthentificationRequise("pas de session SharePoint : cliquez sur « Se connecter »")
+    return client
+
+
+def enregistrer_client(client: rest.ClientSharePoint) -> None:
+    with _VERROU_CLIENTS:
+        _CLIENTS[client.hote] = client
+
+
+def oublier_connexion() -> None:
+    """Oublie les sessions de l'outil (mémoire et profil du navigateur dédié)."""
+    from .navigateur import dossier_profil
+    with _VERROU_CLIENTS:
+        _CLIENTS.clear()
+    shutil.rmtree(dossier_profil(), ignore_errors=True)
+
+
+def connecter_navigateur(
+    texte: str,
+    on_etape: Callable[[str], None] | None = None,
+    interactif: bool = True,
+    delai_s: float = 300,
+    delai_silencieux_s: float = 15,
+    fabrique: Callable[..., NavigateurPilote] = NavigateurPilote,
+    client_factory: Callable[[str, dict], rest.ClientSharePoint] = rest.ClientSharePoint,
+) -> SourceAudit:
+    """Connexion au dossier SharePoint avec l'identité de l'utilisateur, via le navigateur.
+
+    1. Sans fenêtre : le profil dédié a peut-être encore une session valide.
+    2. Sinon (``interactif``) : une fenêtre du navigateur s'ouvre sur le dossier ;
+       l'utilisateur s'identifie ; dès que la session ouvre le dossier par l'API,
+       la fenêtre se ferme et l'outil est connecté.
+
+    Raises:
+        LienInvalide: lien inexploitable.
+        NavigateurIndisponible: ni Edge ni Chrome.
+        NavigateurFerme: fenêtre fermée avant la fin de la connexion.
+        AccesImpossible: délai dépassé, dossier introuvable, ou session sans droits.
+        rest.AuthentificationRequise: non interactif et aucune session valide.
+    """
+    lien = analyser_lien(texte)
+
+    def dire(message: str) -> None:
+        if on_etape is not None:
+            on_etape(message)
+
+    def essayer(nav: NavigateurPilote) -> rest.ClientSharePoint | None:
+        client = client_factory(lien.hote, cookies_pour(nav.cookies(), lien.hote))
+        try:
+            client.verifier(lien.chemin)
+        except rest.AuthentificationRequise:
+            return None
+        except FileNotFoundError as exc:
+            raise AccesImpossible(
+                f"connecté à SharePoint, mais le dossier est introuvable : {lien.chemin} "
+                "— vérifiez le lien (il doit ouvrir le dossier racine dans le navigateur)"
+            ) from exc
+        return client
+
+    def attendre(nav: NavigateurPilote, limite_s: float, pas_s: float) -> rest.ClientSharePoint | None:
+        fin = time.monotonic() + limite_s
+        while time.monotonic() < fin:
+            if not nav.ouvert():
+                raise NavigateurFerme("fenêtre du navigateur fermée avant la fin de la connexion")
+            try:
+                client = essayer(nav)
+            except NavigateurFerme:
+                raise
+            except (OSError, RuntimeError) as exc:   # navigateur pas encore prêt, réseau…
+                if isinstance(exc, (AccesImpossible, NavigateurIndisponible)):
+                    raise
+                client = None
+            if client is not None:
+                return client
+            time.sleep(pas_s)
+        return None
+
+    dire("vérification d'une session SharePoint existante…")
+    with fabrique(lien.url, visible=False) as nav:
+        client = attendre(nav, delai_silencieux_s, 1.0)
+    if client is None:
+        if not interactif:
+            raise rest.AuthentificationRequise("connexion SharePoint requise : cliquez sur « Se connecter »")
+        dire("🔑 identifiez-vous dans la fenêtre du navigateur (compte professionnel) — "
+             "cochez « Rester connecté » pour ne plus avoir à le faire")
+        with fabrique(lien.url, visible=True) as nav:
+            client = attendre(nav, delai_s, 2.0)
+            if client is None:
+                raise AccesImpossible(f"connexion SharePoint non terminée en {delai_s / 60:.0f} min")
+            dire("✅ identification réussie — fermeture du navigateur")
+    enregistrer_client(client)
+    return SourceAudit(API, lien.url, lien.url)
+
+
+def navigateur_disponible() -> bool:
+    return trouver_navigateur() is not None
+
+
+# ── Connexion de repli (sans navigateur) ──────────────────────────
 def connecter(
     texte: str,
     delai_s: float = 45,
@@ -368,9 +492,77 @@ def session_excel_interactive():
     return SessionExcel(connexion_interactive=True)
 
 
+class AccesApi(AccesFichiers):
+    """Source ``api`` : dossiers listés et fichiers téléchargés par l'API SharePoint,
+    avec la session du navigateur. Les copies temporaires sont supprimées à la fin."""
+
+    def __init__(self, source: SourceAudit, client: rest.ClientSharePoint | None = None):
+        self.source = source
+        self.client = client or client_pour(source.lien)
+        self.racine = rest.chemin_serveur(source.lien)
+        self._dossier = ""
+        self._compteur = 0
+        self._fichiers: dict[str, list[dict]] = {}
+        self._verrou = threading.Lock()
+
+    def __enter__(self) -> "AccesApi":
+        self._dossier = tempfile.mkdtemp(prefix="avf_sharepoint_")
+        return self
+
+    def __exit__(self, *exc) -> bool:
+        shutil.rmtree(self._dossier, ignore_errors=True)
+        return False
+
+    def _dossier_commune(self, commune: str) -> str:
+        code = commune.strip().upper()
+        return f"{self.racine}/Dep{code[:2]}/{code}"
+
+    def _liste(self, commune: str) -> list[dict]:
+        dossier = self._dossier_commune(commune)
+        with self._verrou:
+            if dossier in self._fichiers:
+                return self._fichiers[dossier]
+        try:
+            fichiers = self.client.fichiers(dossier)
+        except FileNotFoundError:
+            fichiers = []
+        with self._verrou:
+            self._fichiers[dossier] = fichiers
+        return fichiers
+
+    def trouver(self, racine: str, commune: str) -> str | None:
+        nom = rest.fichier_audit(self._liste(commune))
+        return self.client.url(f"{self._dossier_commune(commune)}/{nom}") if nom else None
+
+    def conflits(self, racine: str, commune: str) -> list[dict]:
+        dossier = self._dossier_commune(commune)
+        return [{"chemin": self.client.url(f"{dossier}/{nom}"), "date": date}
+                for nom, date in rest.copies_de_conflit(self._liste(commune))]
+
+    def existe(self, commune: str) -> bool:
+        return self.client.dossier_existe(self._dossier_commune(commune))
+
+    def adresse(self, chemin: str) -> str:
+        return chemin
+
+    def lisible(self, chemin: str) -> str:
+        if not self._dossier:
+            raise RuntimeError("AccesApi s'utilise dans un bloc « with »")
+        with self._verrou:
+            self._compteur += 1
+            nom = chemin.rsplit("/", 1)[-1].replace("%20", " ")
+            destination = os.path.join(self._dossier, f"{self._compteur:05d}_{nom}")
+        return self.client.telecharger(rest.chemin_serveur(chemin), destination)
+
+    def lister_communes(self) -> list[tuple[str, str, bool]]:
+        return rest.lister_communes(self.client, self.racine)
+
+
 def acces_pour(source: SourceAudit, session_factory=None,
                montages: list[tuple[str, str]] | None = None) -> AccesFichiers:
     """Accès aux fichiers adapté à la source (contexte à ouvrir avec ``with``)."""
+    if source.mode == API:
+        return AccesApi(source)
     if source.mode == EXCEL:
         return AccesViaExcel(source, session_factory, montages)
     if source.mode == URL:

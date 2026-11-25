@@ -57,7 +57,8 @@ complete_excel_files**. Chacun est couvert par
   communes. Une commune commencée va à son terme.
 - `localiser` et `conflits` (par défaut `trouver_fichier_audit` et
   `detecter_fichiers_conflit`) : un fichier peut être désigné par son adresse
-  SharePoint quand le dossier ne peut pas être parcouru.
+  SharePoint quand le dossier ne peut pas être parcouru. Ces appels peuvent passer par
+  le réseau : leur échec met la commune en erreur, sans interrompre le lot.
 - `prereperage` (par défaut `True` : comportement d'origine). Avec `False`, Excel est
   toujours ouvert, sans vérifier d'abord la présence des ID dans le fichier parcouru.
   C'est nécessaire quand ce fichier est une copie locale qui peut différer du serveur.

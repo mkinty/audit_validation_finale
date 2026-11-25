@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-LOCAL, WEBDAV, EXCEL, URL = "local", "webdav", "excel", "url"
+LOCAL, WEBDAV, EXCEL, URL, API = "local", "webdav", "excel", "url", "api"
 
 _LIBELLES = {
     LOCAL: "Dossier local",
+    API: "SharePoint — connexion par le navigateur",
     WEBDAV: "SharePoint — accès direct (WebDAV)",
     EXCEL: "SharePoint — via Excel (bibliothèque synchronisée)",
     URL: "SharePoint — via Excel (sans synchronisation)",

@@ -38,7 +38,7 @@ from sna.ui.theme import STYLE_STATUT, Couleurs, Polices
 from .. import chemins
 from ..config import Parametres, charger, enregistrer
 from ..models.audit import AuditCommune, RapportAudit
-from ..models.source import EXCEL, LOCAL, URL, SourceAudit
+from ..models.source import API, EXCEL, LOCAL, URL, SourceAudit
 from ..services import detection, sharepoint
 from sna.services.identifiants import grouper_par_commune
 from ..services.audit import auditer_communes
@@ -144,6 +144,8 @@ class Application(tk.Tk):
         self.champ_lien.bind("<Return>", lambda e: self._connecter_sharepoint())
         self.btn_connecter = bouton(self.ligne_sp, "🔗 Se connecter", self._connecter_sharepoint, "succes")
         self.btn_connecter.pack(side="left", padx=(6, 0))
+        self.btn_oublier = bouton(self.ligne_sp, "🚪 Oublier", self._oublier_connexion, "discret")
+        self.btn_oublier.pack(side="left", padx=(6, 0))
 
         self.lbl_source = tk.Label(c.interieur, text="", bg=Couleurs.FOND_CARTE, fg=Couleurs.TEXTE_SECONDAIRE,
                                    font=Polices.PETIT, anchor="w", justify="left")
@@ -343,7 +345,14 @@ class Application(tk.Tk):
 
     def _executer_connexion(self, lien: str, silencieux: bool) -> None:
         try:
-            source = sharepoint.connecter(lien)
+            if sharepoint.navigateur_disponible():
+                # Identification dans le navigateur, puis API SharePoint avec cette session.
+                source = sharepoint.connecter_navigateur(
+                    lien, on_etape=lambda m: self.journaliser(f"   · {m}", Couleurs.TEXTE_SECONDAIRE),
+                    interactif=not silencieux,
+                )
+            else:
+                source = sharepoint.connecter(lien)
         except Exception as exc:  # noqa: BLE001 — LienInvalide, AccesImpossible, ou imprévu
             # Le message est lu ici : « exc » n'existe plus quand le rappel s'exécute.
             message = str(exc) or exc.__class__.__name__
@@ -408,14 +417,37 @@ class Application(tk.Tk):
         return False
 
     # ══ Communes ══════════════════════════════════════════════════
+    def _oublier_connexion(self) -> None:
+        """Oublie la session SharePoint de l'outil (pour changer de compte, par exemple)."""
+        if self.occupe:
+            return
+        if not messagebox.askyesno("Oublier la connexion", "Oublier la connexion SharePoint de l'outil ?\n"
+                                   "Il faudra vous identifier de nouveau dans le navigateur.", parent=self):
+            return
+        sharepoint.oublier_connexion()
+        self._source_sp = None
+        self._remplir_communes([])
+        self._maj_lbl_source()
+        self._maj_etat()
+        self.journaliser("🚪 Connexion SharePoint oubliée", Couleurs.INFO)
+
     def _existe(self, dossier: str) -> bool:
-        """Un dossier de commune existe-t-il ? Sans parcours possible (mode URL), on ne peut
-        pas le vérifier : la commune est retenue, son fichier sera cherché à son adresse."""
+        """Un dossier de commune existe-t-il ? Par l'API en connexion navigateur ; sans
+        parcours possible (mode URL), on ne peut pas le vérifier : la commune est retenue,
+        son fichier sera cherché à son adresse."""
         source = self._source()
+        if source is not None and source.mode == API:
+            try:
+                return sharepoint.AccesApi(source).existe(os.path.basename(dossier.rstrip("\\/")))
+            except OSError:
+                return False
         return True if source is not None and not source.listable else os.path.isdir(dossier)
 
     def _detecter_communes(self) -> None:
         if not self._verifier_racine():
+            return
+        if self._source().mode == API:
+            self._detecter_communes_api()
             return
         if not self._source().listable:
             messagebox.showinfo(
@@ -424,6 +456,40 @@ class Application(tk.Tk):
             return
         self._effacer_ids(silencieux=True)
         communes = detection.lister_communes(self._racine())
+        if not communes:
+            messagebox.showinfo("Communes", "Aucune commune trouvée sous la racine "
+                                "(<racine>/Dep<XX>/<commune>).", parent=self)
+        avec_fichier = [c.code for c in communes if c.a_fichier]
+        self._remplir_communes(communes, selection=avec_fichier)
+        sans = len(communes) - len(avec_fichier)
+        self.journaliser(
+            f"🔍 {len(communes)} commune(s) détectée(s)"
+            + (f" — {sans} sans fichier audit (non sélectionnée(s))" if sans else ""), Couleurs.INFO)
+
+    def _detecter_communes_api(self) -> None:
+        """Liste les communes par l'API SharePoint (thread de fond : une requête par Dep<XX>)."""
+        if self.occupe:
+            return
+        self._effacer_ids(silencieux=True)
+        self._debut_traitement()
+        self.journaliser("🔍 Recherche des communes sur SharePoint…", Couleurs.INFO)
+        source = self._source()
+
+        def travail() -> None:
+            try:
+                trouvees = sharepoint.AccesApi(source).lister_communes()
+            except Exception as exc:  # noqa: BLE001
+                message = str(exc) or exc.__class__.__name__
+                self.planifier(lambda: (self._fin_traitement(),
+                                        self.journaliser(f"❌ Communes non listées : {message}", Couleurs.ERREUR)))
+                return
+            communes = [detection.CommuneDetectee(code, dep, source.url_fichier(code).rsplit("/", 1)[0], a)
+                        for code, dep, a in trouvees]
+            self.planifier(lambda: (self._fin_traitement(), self._communes_detectees(communes)))
+
+        threading.Thread(target=travail, daemon=True).start()
+
+    def _communes_detectees(self, communes) -> None:
         if not communes:
             messagebox.showinfo("Communes", "Aucune commune trouvée sous la racine "
                                 "(<racine>/Dep<XX>/<commune>).", parent=self)
@@ -889,6 +955,7 @@ class Application(tk.Tk):
     def _maj_etat(self) -> None:
         racine_ok = self._racine_ok()
         self.btn_connecter.config(state="normal" if not self.occupe else "disabled")
+        self.btn_oublier.config(state="normal" if not self.occupe else "disabled")
         for bouton_radio in self.choix_source.values():
             bouton_radio.config(state="normal" if not self.occupe else "disabled")
         nb_com, nb_com_sel = len(self.liste_com.codes), len(self.liste_com.curselection())
