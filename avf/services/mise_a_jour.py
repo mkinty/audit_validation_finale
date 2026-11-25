@@ -53,6 +53,7 @@ class BilanMiseAJour:
     duree: float = 0.0
     nb_en_attente: int = 0
     nb_communes_demandees: int = 0
+    via_api: bool = False   # écriture par l'API SharePoint (session du navigateur)
 
     @property
     def interrompu(self) -> bool:
@@ -154,16 +155,23 @@ def mettre_a_jour(
         EcritureSharePointImpossible: source SharePoint sans Excel disponible.
     """
     depart = time.perf_counter()
+    # Connexion par le navigateur : la mise à jour utilise la même session, par l'API
+    # SharePoint (téléchargement, moteur openpyxl de complete_excel_files, renvoi
+    # conditionnel à la version lue) — ni Excel, ni autre identification.
+    via_api = source is not None and source.mode == API and not simuler
     sharepoint = source is not None and source.sharepoint
-    if sharepoint and not simuler:
+    if sharepoint and not simuler and not via_api:
         if not _excel_disponible(session_factory):
             raise EcritureSharePointImpossible(
                 "la mise à jour d'un dossier SharePoint passe par Excel (co-édition), "
                 "et Excel / pywin32 ne sont pas disponibles sur ce poste"
             )
         via_excel = True
-    ecrire_via_excel = via_excel and not simuler and _excel_disponible(session_factory)
-    if session_factory is SessionExcel:
+    ecrire_via_excel = via_excel and not simuler and not via_api and _excel_disponible(session_factory)
+    if via_api:
+        from .sharepoint import SessionApi, client_pour
+        contexte = SessionApi(client_pour(source.lien))
+    elif session_factory is SessionExcel:
         # Si Office demande la connexion Microsoft 365, la montrer plutôt qu'échouer.
         contexte = SessionExcel(connexion_interactive=True) if ecrire_via_excel else nullcontext()
     else:
@@ -191,7 +199,7 @@ def mettre_a_jour(
         resultats = traiter_communes(
             groupes, regles, racine, simuler=simuler,
             on_progression=on_progression, on_resultat=on_resultat, on_etape=on_etape,
-            session_excel=session if ecrire_via_excel else None,
+            session_excel=session if (ecrire_via_excel or via_api) else None,
             paralleles=paralleles, doit_arreter=doit_arreter,
             prereperage=not (source is not None and source.mode in (EXCEL, URL, API)),
             localiser=localiser,
@@ -201,7 +209,7 @@ def mettre_a_jour(
     echecs, reussis = attente.calculer_echecs_et_reussites(groupes, resultats)
     bilan = BilanMiseAJour(
         resultats=resultats, echecs=echecs, reussis=reussis, simulation=simuler,
-        via_excel=ecrire_via_excel, duree=time.perf_counter() - depart,
+        via_excel=ecrire_via_excel, via_api=via_api, duree=time.perf_counter() - depart,
         nb_communes_demandees=len(groupes),
     )
     if fichier_attente and not simuler:

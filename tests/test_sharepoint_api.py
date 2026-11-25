@@ -35,6 +35,14 @@ _APPEL = re.compile(r"^(?P<site>/sites/SNA)?/_api/web/(?P<res>GetFolderByServerR
 class _FauxSharePoint(http.server.BaseHTTPRequestHandler):
     racine = ""
     appels: list = []
+    versions: dict = {}            # chemin local → numéro de version (ETag)
+    verrouilles: set = set()       # chemins locaux verrouillés (423 à l'écriture)
+    extraits: dict = {}            # chemins locaux extraits → par qui
+    avant_ecriture = None          # rappel(chemin local) juste avant d'accepter une écriture
+    ignorer_ecritures = False      # simule un serveur qui « perd » l'écriture
+
+    def _etag(self, local):
+        return f'"{{AAAA-BBBB}},{type(self).versions.get(local, 1)}"'
 
     def log_message(self, *a):
         pass
@@ -44,9 +52,11 @@ class _FauxSharePoint(http.server.BaseHTTPRequestHandler):
             return None
         return os.path.join(self.racine, *[p for p in chemin[len(DOSSIER):].split("/") if p])
 
-    def _envoyer(self, code, corps, type_="application/json"):
+    def _envoyer(self, code, corps, type_="application/json", entetes=None):
         donnees = corps if isinstance(corps, bytes) else json.dumps(corps).encode()
         self.send_response(code)
+        for k, v in (entetes or {}).items():
+            self.send_header(k, v)
         self.send_header("Content-Type", type_)
         self.send_header("Content-Length", str(len(donnees)))
         self.end_headers()
@@ -62,9 +72,16 @@ class _FauxSharePoint(http.server.BaseHTTPRequestHandler):
         chemin = unquote(m.group("chemin")).replace("''", "'")
         local, suite, q = self._local(chemin), m.group("suite") or "", unquote(m.group("q") or "")
         if m.group("res") == "GetFileByServerRelativePath":
-            if suite == "/$value" and local and os.path.isfile(local):
-                return self._envoyer(200, open(local, "rb").read(), "application/octet-stream")
-            return self._envoyer(404, {"odata.error": {"message": {"value": "fichier introuvable"}}})
+            if not (local and os.path.isfile(local)):
+                return self._envoyer(404, {"odata.error": {"message": {"value": "fichier introuvable"}}})
+            if suite == "/$value":
+                return self._envoyer(200, open(local, "rb").read(), "application/octet-stream",
+                                     {"ETag": self._etag(local)})
+            if suite == "" and "ETag" in q:
+                qui = type(self).extraits.get(local)
+                return self._envoyer(200, {"ETag": self._etag(local), "CheckOutType": 0 if qui else 2,
+                                           "CheckedOutByUser": {"Title": qui} if qui else None})
+            return self._envoyer(400, {})
         if not local or not os.path.isdir(local):
             if suite == "" and "Exists" in q:
                 return self._envoyer(404, {"odata.error": {"message": {"value": "introuvable"}}})
@@ -81,6 +98,34 @@ class _FauxSharePoint(http.server.BaseHTTPRequestHandler):
             return self._envoyer(200, {"value": [{"Name": n} for n in dossiers]})
         return self._envoyer(400, {})
 
+    def do_POST(self):
+        cls = type(self)
+        cls.appels.append("POST " + unquote(self.path))
+        corps = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        if "FedAuth=valide" not in (self.headers.get("Cookie") or ""):
+            return self._envoyer(403, {"odata.error": {"message": {"value": "Accès refusé"}}})
+        if self.path == "/sites/SNA/_api/contextinfo":
+            return self._envoyer(200, {"FormDigestValue": "jeton-valide"})
+        m = _APPEL.match(self.path)
+        if not m or m.group("res") != "GetFileByServerRelativePath" or m.group("suite") != "/$value" \
+                or self.headers.get("X-HTTP-Method") != "PUT":
+            return self._envoyer(400, {})
+        if self.headers.get("X-RequestDigest") != "jeton-valide":
+            return self._envoyer(403, {"odata.error": {"message": {"value": "jeton de formulaire invalide"}}})
+        local = self._local(unquote(m.group("chemin")).replace("''", "'"))
+        if cls.avant_ecriture:
+            cls.avant_ecriture(local)
+        if local in cls.verrouilles:
+            return self._envoyer(423, {"odata.error": {"message": {
+                "value": "The file is locked for shared use by Collègue"}}})
+        if self.headers.get("If-Match") not in ("*", self._etag(local)):
+            return self._envoyer(412, {"odata.error": {"message": {"value": "version modifiée"}}})
+        if not cls.ignorer_ecritures:
+            with open(local, "wb") as f:
+                f.write(corps)
+        cls.versions[local] = cls.versions.get(local, 1) + 1
+        return self._envoyer(204, b"")
+
 
 def _fichiers(dossier):
     return [{"Name": n, "TimeLastModified": datetime.fromtimestamp(
@@ -90,7 +135,8 @@ def _fichiers(dossier):
 
 @pytest.fixture
 def serveur(racine):
-    gestionnaire = type("Faux", (_FauxSharePoint,), {"racine": racine, "appels": []})
+    gestionnaire = type("Faux", (_FauxSharePoint,), {"racine": racine, "appels": [], "versions": {},
+                                                     "verrouilles": set(), "extraits": {}})
     srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), gestionnaire)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     yield srv, gestionnaire
@@ -196,30 +242,6 @@ def test_session_expiree_pendant_l_audit(source_api, serveur):
     with sp.acces_pour(source_api) as acces:
         c = auditer_communes(["13001"], source_api.racine, source=source_api, acces=acces).communes[0]
     assert c.statut is StatutAudit.ERREUR and "session SharePoint" in c.message
-
-
-def test_mise_a_jour_ouvre_l_adresse_trouvee_par_l_api(source_api):
-    from sna.services.excel import BilanFichier
-
-    class Session:
-        def __init__(self):
-            self.vus = []
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *exc):
-            return False
-
-        def appliquer_regles(self, fichier, config, ids, on_etape=None):
-            self.vus.append(fichier)
-            return BilanFichier(comptes={"R1": 1}, ids_trouves=set(ids))
-
-    session = Session()
-    bilan = mettre_a_jour({"13001": ["13001_2"], "75021": ["75021_1"]}, ReglesConfig.defaut(), source_api.racine,
-                          session_factory=lambda: session, source=source_api)
-    assert session.vus == [LIEN + "/Dep13/13001/audit_13001.xlsx"]
-    assert "conflit" in bilan.echecs["75021_1"]                       # refus, comme en local
 
 
 # ── Connexion par le navigateur (navigateur simulé) ───────────────
@@ -333,3 +355,96 @@ def test_simulation_sur_la_version_serveur_telechargee(source_api, racine):
                           simuler=True, source=source_api)
     assert bilan.simulation and bilan.nb_communes_ok == 1 and bilan.nb_modifications == 4
     assert open(os.path.join(racine, "Dep13", "13001", "audit_13001.xlsx"), "rb").read() == avant
+
+
+
+# ── Mise à jour par l'API, avec la session du navigateur ──────────
+class _PasDExcel:
+    def __call__(self):
+        raise AssertionError("la mise à jour en connexion navigateur ne doit pas lancer Excel")
+
+
+def _audit_api(source):
+    with sp.acces_pour(source) as acces:
+        return auditer_communes(["13001", "2A004", "75021"], source.racine, source=source, acces=acces)
+
+
+def test_mise_a_jour_par_l_api_sans_excel(source_api, racine, serveur):
+    from avf.services.mise_a_jour import groupes_depuis_rapport, preparer_regles
+    from datetime import date
+    srv, faux = serveur
+    regles = preparer_regles(ReglesConfig.defaut(), aujourd_hui=date(2026, 11, 26))
+    messages = []
+    bilan = mettre_a_jour(groupes_depuis_rapport(_audit_api(source_api)), regles, source_api.racine,
+                          via_excel=True, session_factory=_PasDExcel(), source=source_api,
+                          on_etape=lambda c, m: messages.append(m))
+    assert bilan.via_api and not bilan.via_excel
+    par = {r.commune: r for r in bilan.resultats}
+    assert par["13001"].nb_modifications > 0 and par["2A004"].nb_modifications > 0
+    assert "conflit" in par["75021"].message                      # copie de conflit : refus
+    assert any("valeurs vérifiées sur SharePoint" in m for m in messages)
+    assert any(a.startswith("POST /sites/SNA/_api/contextinfo") for a in faux.appels)
+    apres = _audit_api(source_api)                                 # ré-audit sur le serveur
+    assert apres.ids_non_valides_par_commune() == {"75021": ["75021_1"]}
+    from openpyxl import load_workbook
+    ws = load_workbook(os.path.join(racine, "Dep13", "13001", "audit_13001.xlsx"))["Audit"]
+    assert ws["F3"].value == "OK" and ws["D3"].value == datetime(2026, 11, 26)   # vraie date Excel
+
+
+def test_modification_concurrente_jamais_ecrasee(source_api, racine, serveur):
+    """Un collègue enregistre entre la lecture et l'envoi : sa version est relue, rien n'est perdu."""
+    from openpyxl import load_workbook
+    srv, faux = serveur
+    fichier = os.path.join(racine, "Dep13", "13001", "audit_13001.xlsx")
+    deja = []
+
+    def collegue(local):
+        if local == fichier and not deja:
+            deja.append(1)
+            wb = load_workbook(fichier)
+            wb["Audit"]["B2"] = "modifié par un collègue"
+            wb.save(fichier)
+            faux.versions[fichier] = faux.versions.get(fichier, 1) + 1
+
+    faux.avant_ecriture = staticmethod(collegue)
+    messages = []
+    bilan = mettre_a_jour({"13001": ["13001_2"]}, ReglesConfig.defaut(), source_api.racine,
+                          source=source_api, on_etape=lambda c, m: messages.append(m))
+    r = bilan.resultats[0]
+    assert r.statut.name == "SUCCES" and r.ids_non_verifies == []
+    assert any("enregistré par quelqu'un d'autre" in m for m in messages)
+    ws = load_workbook(fichier)["Audit"]
+    assert ws["B2"].value == "modifié par un collègue"          # sa modification est conservée
+    assert ws["F3"].value == "OK"                               # et la nôtre est appliquée
+
+
+def test_fichier_verrouille_rien_ecrit(source_api, racine, serveur):
+    srv, faux = serveur
+    fichier = os.path.join(racine, "Dep13", "13001", "audit_13001.xlsx")
+    avant = open(fichier, "rb").read()
+    faux.verrouilles.add(fichier)
+    bilan = mettre_a_jour({"13001": ["13001_2"]}, ReglesConfig.defaut(), source_api.racine, source=source_api)
+    assert "verrouill" in bilan.resultats[0].message and "13001_2" in bilan.echecs
+    assert open(fichier, "rb").read() == avant
+
+
+def test_fichier_extrait_rien_ecrit(source_api, racine, serveur):
+    srv, faux = serveur
+    fichier = os.path.join(racine, "Dep13", "13001", "audit_13001.xlsx")
+    faux.extraits[fichier] = "Alice Martin"
+    bilan = mettre_a_jour({"13001": ["13001_2"]}, ReglesConfig.defaut(), source_api.racine, source=source_api)
+    assert bilan.resultats[0].message == "classeur verrouillé par Alice Martin"
+
+
+def test_ecriture_non_retrouvee_id_en_attente(source_api, serveur):
+    srv, faux = serveur
+    faux.ignorer_ecritures = True
+    bilan = mettre_a_jour({"13001": ["13001_2"]}, ReglesConfig.defaut(), source_api.racine, source=source_api)
+    assert bilan.resultats[0].ids_non_verifies == ["13001_2"]
+    assert "13001_2" in bilan.echecs
+
+
+def test_valeurs_deja_en_place_rien_envoye(source_api, serveur):
+    srv, faux = serveur
+    mettre_a_jour({"13001": ["13001_1"]}, ReglesConfig(regles=[]), source_api.racine, source=source_api)
+    assert not any(a.startswith("POST") for a in faux.appels)

@@ -9,8 +9,20 @@ fait la page SharePoint elle-même :
     GET {site}/_api/web/GetFileByServerRelativePath(decodedurl='…')/$value
 
 C'est la version **serveur** des fichiers qui est lue : ni OneDrive, ni WebDAV,
-ni Excel. Lecture seule : l'API n'est jamais utilisée pour écrire (la mise à
-jour passe par Excel, en co-édition).
+ni Excel.
+
+Écriture (mise à jour, cf. ``services.sharepoint.SessionApi``) :
+
+    POST {site}/_api/contextinfo                              → jeton de formulaire
+    POST {site}/_api/web/GetFileByServerRelativePath(…)/$value
+         X-HTTP-Method: PUT, If-Match: <ETag lu au téléchargement>
+
+``If-Match`` garantit qu'on ne remplace jamais une version que l'on n'a pas
+lue : si quelqu'un a enregistré le fichier entre-temps, SharePoint refuse
+(:class:`VersionModifiee`) et la mise à jour repart de la nouvelle version. Un
+fichier extrait ou verrouillé (ouvert en co-édition) est signalé
+(:class:`FichierVerrouille`) plutôt qu'écrasé. SharePoint garde l'historique
+des versions : chaque mise à jour en crée une nouvelle.
 """
 
 from __future__ import annotations
@@ -31,6 +43,14 @@ _SITE = re.compile(r"^/(sites|teams|personal|portals)/[^/]+", re.I)
 
 class AuthentificationRequise(PermissionError):
     """La session SharePoint est absente, expirée, ou n'ouvre pas ce dossier."""
+
+
+class VersionModifiee(RuntimeError):
+    """Le fichier a été enregistré par quelqu'un d'autre depuis sa lecture (``If-Match``)."""
+
+
+class FichierVerrouille(RuntimeError):
+    """Fichier extrait ou verrouillé (ouvert en co-édition) : SharePoint refuse l'écriture."""
 
 
 def site_de(chemin_serveur: str) -> str:
@@ -55,24 +75,35 @@ class ClientSharePoint:
 
     # ── Requêtes ──────────────────────────────────────────────────
     def _requete(self, chemin: str, binaire: bool = False) -> bytes:
-        requete = urllib.request.Request(f"{self.base}{chemin}", headers={
+        return self._echange(chemin, binaire=binaire)[0]
+
+    def _echange(self, chemin: str, binaire: bool = False, methode: str = "GET",
+                 donnees: bytes | None = None, entetes: dict | None = None) -> tuple[bytes, dict]:
+        """Requête à l'API ; renvoie ``(corps, en-têtes de réponse)``."""
+        requete = urllib.request.Request(f"{self.base}{chemin}", data=donnees, method=methode, headers={
             "Cookie": "; ".join(f"{k}={v}" for k, v in self.cookies.items()),
             "Accept": "application/octet-stream" if binaire else "application/json;odata=nometadata",
             "User-Agent": "AuditValidationFinale",
+            **(entetes or {}),
         })
         try:
             with urllib.request.urlopen(requete, timeout=self.delai_s) as reponse:
                 if urlsplit(reponse.geturl()).hostname != urlsplit(self.base).hostname:
                     raise AuthentificationRequise("session SharePoint absente ou expirée")
-                return reponse.read()
+                return reponse.read(), dict(reponse.headers.items())
         except urllib.error.HTTPError as exc:
+            message = _message_erreur(exc)
+            if exc.code == 412:
+                raise VersionModifiee("fichier enregistré par quelqu'un d'autre depuis sa lecture") from None
+            if exc.code == 423 or _est_verrou(message):
+                raise FichierVerrouille(f"fichier verrouillé sur SharePoint ({message or 'ouvert ou extrait'})") from None
             if exc.code in (401, 403):
                 raise AuthentificationRequise(
                     "session SharePoint absente ou expirée (ou droits insuffisants sur ce dossier)"
                 ) from None
             if exc.code == 404:
                 raise FileNotFoundError(f"introuvable sur SharePoint : {chemin}") from None
-            raise OSError(f"SharePoint a répondu {exc.code} : {_message_erreur(exc)}") from None
+            raise OSError(f"SharePoint a répondu {exc.code} : {message}") from None
 
     def _api(self, chemin_serveur: str, ressource: str, suite: str = "") -> str:
         valeur = quote(chemin_serveur.replace("'", "''"), safe="/")
@@ -120,6 +151,56 @@ class ClientSharePoint:
             f.write(contenu)
         return destination
 
+    # ── Écriture ──────────────────────────────────────────────────
+    def telecharger_version(self, chemin_fichier: str, destination: str) -> str:
+        """Télécharge le fichier et renvoie l'ETag **du contenu téléchargé**.
+
+        L'ETag vient de la réponse elle-même quand SharePoint le fournit ; sinon il
+        est lu avant et après le téléchargement, qui est refait s'il a changé
+        entre les deux (enregistrement concurrent).
+        """
+        for _ in range(3):
+            avant = self.etat_fichier(chemin_fichier)["ETag"]
+            contenu, entetes = self._echange(
+                self._api(chemin_fichier, "GetFileByServerRelativePath", "/$value"), binaire=True)
+            etag = next((v for k, v in entetes.items() if k.lower() == "etag"), "") or ""
+            if not etag:
+                etag = self.etat_fichier(chemin_fichier)["ETag"]
+                if etag != avant:
+                    continue
+            with open(destination, "wb") as f:
+                f.write(contenu)
+            return etag
+        raise VersionModifiee("fichier enregistré en continu par quelqu'un d'autre : rejouez plus tard")
+
+    def etat_fichier(self, chemin_fichier: str) -> dict:
+        """``{"ETag", "CheckOutType", "CheckedOutBy"}`` : version courante et extraction."""
+        donnees = self._json(self._api(chemin_fichier, "GetFileByServerRelativePath",
+                                       "?$select=ETag,CheckOutType&$expand=CheckedOutByUser"))
+        qui = (donnees.get("CheckedOutByUser") or {}).get("Title", "")
+        return {"ETag": donnees.get("ETag", ""), "CheckOutType": donnees.get("CheckOutType", 2),
+                "CheckedOutBy": qui}
+
+    def jeton(self, chemin_serveur: str) -> str:
+        """Jeton de formulaire (« request digest ») exigé par SharePoint pour écrire."""
+        corps, _ = self._echange(f"{site_de(chemin_serveur)}/_api/contextinfo", methode="POST", donnees=b"")
+        return json.loads(corps.decode("utf-8"))["FormDigestValue"]
+
+    def remplacer(self, chemin_fichier: str, contenu: bytes, etag: str) -> None:
+        """Remplace le contenu du fichier, **seulement** s'il est encore à la version ``etag``.
+
+        Raises:
+            VersionModifiee: quelqu'un l'a enregistré depuis.
+            FichierVerrouille: fichier extrait / verrouillé.
+        """
+        self._echange(
+            self._api(chemin_fichier, "GetFileByServerRelativePath", "/$value"),
+            methode="POST", donnees=contenu,
+            entetes={"X-HTTP-Method": "PUT", "If-Match": etag or "*",
+                     "X-RequestDigest": self.jeton(chemin_fichier),
+                     "Content-Type": "application/octet-stream"},
+        )
+
     def url(self, chemin_serveur: str) -> str:
         return f"https://{self.hote}{quote(chemin_serveur, safe='/')}"
 
@@ -155,6 +236,11 @@ def lister_communes(client: ClientSharePoint, racine: str, paralleles: int = 8):
         for code, fichiers in contenu.items():
             communes.append((code.upper(), code[:2].upper(), fichier_audit(fichiers) is not None))
     return sorted(set(communes))
+
+
+def _est_verrou(message: str) -> bool:
+    texte = (message or "").lower()
+    return any(m in texte for m in ("locked", "verrouill", "checked out", "extrait"))
 
 
 def _est_audit(nom: str) -> bool:

@@ -558,6 +558,109 @@ class AccesApi(AccesFichiers):
         return rest.lister_communes(self.client, self.racine)
 
 
+class SessionApi:
+    """Mise à jour par l'API SharePoint, avec la session du navigateur (pas d'Excel).
+
+    Même interface que ``sna.services.excel_com.SessionExcel`` : le moteur de
+    complete_excel_files (``traiter_communes``) l'utilise sans changement. Pour
+    chaque fichier :
+
+    1. téléchargement de la version serveur, avec son ETag ;
+    2. application des règles par le moteur (``sna.services.excel.appliquer_regles``,
+       l'écriture openpyxl de complete_excel_files : règles, filtres retirés,
+       mise en forme reprise, vraies dates) ;
+    3. renvoi au serveur **seulement si le fichier est encore à cette version**
+       (``If-Match``) ; sinon, quelqu'un l'a enregistré entre-temps : on repart
+       de sa version (aucune modification d'autrui n'est écrasée) ;
+    4. relecture de la version serveur : les règles n'y ont plus rien à changer,
+       sinon les ID sont « non confirmés » (rejoints aux ID en attente).
+
+    Un fichier extrait ou verrouillé est signalé « verrouillé » sans rien écrire.
+    """
+
+    TENTATIVES = 3
+
+    def __init__(self, client: rest.ClientSharePoint):
+        self.client = client
+        self._dossier = ""
+        self._compteur = 0
+        self._verrou = threading.Lock()
+
+    def __enter__(self) -> "SessionApi":
+        self._dossier = tempfile.mkdtemp(prefix="avf_maj_sharepoint_")
+        return self
+
+    def __exit__(self, *exc) -> bool:
+        shutil.rmtree(self._dossier, ignore_errors=True)
+        return False
+
+    def _copie(self, adresse: str) -> str:
+        with self._verrou:
+            self._compteur += 1
+            return os.path.join(self._dossier, f"{self._compteur:05d}_{adresse.rsplit('/', 1)[-1].replace('%20', ' ')}")
+
+    def appliquer_regles(self, fichier: str, config, ids_erreur, on_etape=None):
+        from sna.services.excel import appliquer_regles
+
+        def dire(message: str) -> None:
+            if on_etape is not None:
+                on_etape(message)
+
+        ids = list(ids_erreur)
+        chemin = rest.chemin_serveur(fichier)
+        etat = self.client.etat_fichier(chemin)
+        if etat["CheckOutType"] != 2:                  # 2 = non extrait
+            from sna.services.excel import BilanFichier
+            bilan = BilanFichier(comptes={r.code: 0 for r in config.actives})
+            bilan.verrouille = etat["CheckedOutBy"] or "un autre utilisateur (fichier extrait)"
+            dire(f"⚠ fichier extrait par {bilan.verrouille} — rien écrit")
+            return bilan
+        for essai in range(1, self.TENTATIVES + 1):
+            local = self._copie(fichier)
+            etag = self.client.telecharger_version(chemin, local)
+            dire(f"version serveur téléchargée (API SharePoint, essai {essai})")
+            bilan = appliquer_regles(local, config, ids, on_etape=on_etape)
+            bilan.ouverture = "API SharePoint (session du navigateur)"
+            bilan.tentatives = essai
+            if not bilan.enregistre:
+                return bilan                           # rien à écrire : valeurs déjà en place
+            with open(local, "rb") as f:
+                contenu = f.read()
+            try:
+                dire("envoi sur SharePoint (si personne ne l'a modifié entre-temps)…")
+                self.client.remplacer(chemin, contenu, etag)
+            except rest.VersionModifiee:
+                dire("↻ fichier enregistré par quelqu'un d'autre entre-temps — nouvelle lecture")
+                continue
+            except rest.FichierVerrouille as exc:
+                bilan.verrouille = str(exc)
+                bilan.enregistre = False
+                bilan.comptes = {k: 0 for k in bilan.comptes}
+                dire(f"⚠ {exc} — rien écrit")
+                return bilan
+            self._verifier(chemin, config, bilan, dire)
+            return bilan
+        raise rest.VersionModifiee(
+            f"fichier enregistré par d'autres à chaque tentative ({self.TENTATIVES}) : rejouez plus tard")
+
+    def _verifier(self, chemin: str, config, bilan, dire) -> None:
+        """Relit la version serveur : les règles ne doivent plus rien y changer."""
+        from sna.services.excel import appliquer_regles
+        relu = self._copie(chemin)
+        try:
+            self.client.telecharger(chemin, relu)
+            reste = appliquer_regles(relu, config, sorted(bilan.ids_trouves), simuler=True)
+        except Exception as exc:  # noqa: BLE001 — l'envoi a réussi : on ne met pas la commune en échec
+            bilan.ids_non_verifies = sorted(bilan.ids_trouves)
+            dire(f"⚠ relecture impossible après l'envoi ({exc}) — ID remis en attente")
+            return
+        if reste.nb_modifications:
+            bilan.ids_non_verifies = sorted(bilan.ids_trouves)
+            dire("⚠ valeurs non retrouvées après l'envoi — ID remis en attente")
+        else:
+            dire("✓ valeurs vérifiées sur SharePoint")
+
+
 def acces_pour(source: SourceAudit, session_factory=None,
                montages: list[tuple[str, str]] | None = None) -> AccesFichiers:
     """Accès aux fichiers adapté à la source (contexte à ouvrir avec ``with``)."""

@@ -702,3 +702,32 @@ def test_oublier_la_connexion_sharepoint(app, monkeypatch, dialogues):
     app._source_sp = SourceAudit(API, LIEN, LIEN)
     app._oublier_connexion()
     assert oublis == [1] and app._source() is None and "Collez le lien" in app.lbl_source["text"]
+
+
+def test_mise_a_jour_avec_la_connexion_navigateur_sans_excel(app, racine, client, monkeypatch, dialogues):
+    """Le cas signalé : en connexion navigateur, la mise à jour ne doit pas dépendre d'Excel."""
+    from avf.models.source import API, SourceAudit
+    from avf.services import sharepoint
+    sharepoint.enregistrer_client(client)
+    try:
+        app.var_source.set("sharepoint")
+        app._changer_source()
+        app._source_sp = SourceAudit(API, LIEN_API, LIEN_API)
+        app._excel = False                                   # « impossible de démarrer Excel »
+        monkeypatch.setattr(DialogueSaisie, "montrer", lambda self: "13001_2 13001_5")
+        app._renseigner_ids()
+        app._lancer_audit()
+        attendre(app)
+        assert app.rapport.nb_ids_non_valides == 2
+        app.fenetre_rapport._maj_tout()
+        attendre(app)
+        attendre(app)                                        # ré-audit par l'API
+        journal = app.txt_log.get("1.0", tk.END)
+        assert "Écriture par l'API SharePoint avec votre connexion" in journal
+        assert "valeurs vérifiées sur SharePoint" in journal
+        assert app.rapport.nb_ids_non_valides == 0
+        confirmation = next(m for t, m in dialogues if t == "Confirmer la mise à jour")
+        assert "avec votre connexion SharePoint (navigateur)" in confirmation
+        assert not any("Excel" in t for t, _ in dialogues)
+    finally:
+        sharepoint._CLIENTS.clear()

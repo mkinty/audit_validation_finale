@@ -60,8 +60,7 @@ contient pas le chemin du dossier : il est refusé, avec la marche à suivre.
 L'outil interroge ensuite l'**API SharePoint** du site **avec votre identité** : liste des
 `Dep<XX>/<commune>`, présence des `audit_*.xlsx` et copies de conflit, puis
 téléchargement de chaque fichier audité. C'est la version du serveur, sans WebDAV, sans
-synchronisation et sans Excel, et plusieurs fichiers sont lus à la fois. L'API n'est
-utilisée qu'en **lecture**.
+synchronisation et sans Excel, et plusieurs fichiers sont lus à la fois.
 
 - **Profil dédié** : Edge tourne sur un profil réservé à l'outil
   (`%LOCALAPPDATA%\AuditValidationFinale\navigateur`), jamais sur le vôtre.
@@ -76,10 +75,24 @@ utilisée qu'en **lecture**.
 - **Session expirée pendant un audit** : les communes concernées sont signalées en
   erreur. Il suffit de cliquer de nouveau sur « Se connecter ».
 
-**Mise à jour** : elle écrit toujours via Excel (co-édition). Le fichier de chaque
-commune est trouvé par l'API, puis ouvert par son adresse SharePoint. Si Excel demande à
-son tour la connexion Microsoft 365, voir plus bas. La **simulation** compte les
-modifications sur une copie téléchargée de la version serveur.
+**Mise à jour, avec la même connexion** : pas d'Excel ni d'autre identification.
+L'option « Écrire via Excel » ne s'applique pas dans ce mode. Pour chaque commune :
+
+1. la version serveur du fichier est téléchargée, avec son numéro de version (ETag) ;
+2. les règles sont appliquées par le **moteur de complete_excel_files** (écriture
+   openpyxl : conditions, retrait des filtres, reprise de la mise en forme, vraies
+   dates) ;
+3. le fichier est renvoyé **seulement s'il est encore à cette version** (`If-Match`).
+   Si quelqu'un l'a enregistré entre-temps, l'outil repart de sa version : la
+   modification du collègue est conservée et la vôtre appliquée par-dessus, jamais
+   écrasée ;
+4. le fichier est relu sur le serveur pour vérifier que les valeurs sont en place.
+   Sinon les ID rejoignent « ID en attente ».
+
+Un fichier extrait ou verrouillé (ouvert en co-édition) est signalé « verrouillé » :
+rien n'est écrit et ses ID sont mis en attente. SharePoint garde l'historique des
+versions : chaque mise à jour en crée une nouvelle, que l'on peut restaurer. La
+**simulation** compte les modifications sur une copie téléchargée de la version serveur.
 
 ### Accès de repli (sans navigateur)
 
@@ -350,10 +363,10 @@ audit_validation_finale/
 .venv\Scripts\python -m pytest
 ```
 
-503 tests : détection, lecture (chemin rapide et repli openpyxl comparés),
+507 tests : détection, lecture (chemin rapide et repli openpyxl comparés),
 critères de validité (dates en texte, casse, valeurs acceptées), audit par ligne et par
 ID, rapport HTML (structure, échappement, données de copie par catégorie), exports
-Excel et CSV, audit limité à des ID erreur saisis, connexion SharePoint par le navigateur et API (faux serveur SharePoint local), source SharePoint (formats de lien, WebDAV, bibliothèque synchronisée,
+Excel et CSV, audit limité à des ID erreur saisis, connexion SharePoint par le navigateur, audit et mise à jour par l'API (faux serveur SharePoint local : versions, verrous, modification concurrente), source SharePoint (formats de lien, WebDAV, bibliothèque synchronisée,
 lecture de la version serveur, connexion lente ou refusée, mise à jour forcée via Excel),
 configuration,
 mise à jour de bout en bout (valeurs écrites cellule par cellule, simulation,

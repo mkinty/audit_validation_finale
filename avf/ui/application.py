@@ -839,7 +839,8 @@ class Application(tk.Tk):
 
         simulation = self.var_simulation.get()
         via_excel = self.var_excel.get() and self._excel and not simulation
-        if source.sharepoint and not simulation:
+        par_api = source.mode == API and not simulation
+        if source.sharepoint and not simulation and not par_api:
             if not self._excel:
                 messagebox.showerror("Mise à jour", "La mise à jour d'un dossier SharePoint passe par Excel "
                                      "(co-édition) : Excel / pywin32 sont introuvables sur ce poste.", parent=parent)
@@ -855,7 +856,9 @@ class Application(tk.Tk):
             + "\n\n" + ("🔍 Mode simulation : aucun fichier ne sera modifié." if simulation else
                         ("⚠️ Les fichiers du dossier SharePoint seront modifiés" if source.sharepoint
                          else "⚠️ Les fichiers audit d'origine seront modifiés")
-                        + (" via Excel (co-édition SharePoint)." if via_excel else " (réécriture directe)."))
+                        + (" avec votre connexion SharePoint (navigateur) — jamais par-dessus une version "
+                           "enregistrée entre-temps par quelqu'un d'autre." if par_api
+                           else " via Excel (co-édition SharePoint)." if via_excel else " (réécriture directe)."))
         )
         if conflits:
             texte += ("\n\n⚠ Copie de conflit présente — ces communes seront refusées : "
@@ -870,7 +873,9 @@ class Application(tk.Tk):
         for regle in regles.actives:
             self.journaliser(f"   ⚙️ {regle.resume()}", Couleurs.TEXTE_SECONDAIRE)
         self.journaliser(
-            "🔐 Écriture via Excel (co-édition SharePoint) — valeurs vérifiées après enregistrement"
+            "🌐 Écriture par l'API SharePoint avec votre connexion (navigateur) — contrôle de version, "
+            "valeurs vérifiées sur le serveur" if par_api
+            else "🔐 Écriture via Excel (co-édition SharePoint) — valeurs vérifiées après enregistrement"
             if via_excel else "📝 Réécriture directe du fichier (openpyxl)", Couleurs.TEXTE_SECONDAIRE)
         self.journaliser(SEPARATEUR, Couleurs.SEPARATEUR)
         threading.Thread(
