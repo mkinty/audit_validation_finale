@@ -7,7 +7,9 @@ import subprocess
 
 import pytest
 
-from avf.models.audit import AuditCommune, IdErreurAudit, LigneAudit, RapportAudit, StatutAudit
+from avf.models.audit import (
+    NON_VALIDES, Anomalie, AuditCommune, IdErreurAudit, LigneAudit, RapportAudit, StatutAudit,
+)
 from avf.services.audit import auditer_communes
 from avf.services.export import exporter_html, nom_fichier_defaut
 from avf.views import presentation as p
@@ -66,23 +68,49 @@ def test_html_bien_forme(rapport):
 
 def test_html_contient_chiffres_et_ids(rapport):
     html = generer_html(rapport)
-    assert "Audit de la Validation finale" in html
-    for ident in rapport.tous_ids_vides():
+    assert "Audit des fichiers — Validation finale" in html
+    for ident in rapport.ids_de(NON_VALIDES):
         assert ident in html
-    assert f">{p.nombre(rapport.nb_vides)}<" in html
+    assert f">{p.nombre(rapport.nb_lignes_non_valides)}<" in html
+    assert f">{p.nombre(rapport.nb_lignes_valides)}<" in html
     assert "Fichier introuvable" in html and "Erreur de lecture" in html
     assert "copie en conflit" in html
+    assert "Audit = OK / KO · Date audit = une date · Auditeur renseigné · Validation finale = OK" in html
+
+
+def test_detail_par_ligne_avec_validation_finale_et_motifs(rapport):
+    html = generer_html(rapport)
+    assert "<th>Validation finale</th><th>Motifs</th>" in html
+    assert html.count('<tr class="l-validee">') == rapport.nb_lignes_valides
+    assert html.count('<tr class="l-non-valide">') == rapport.nb_lignes_non_valides
+    assert "Validation finale « Validé » ≠ OK" in html
+    assert "<td>Validé</td>" in html                   # la valeur lue est affichée
+
+
+def test_motifs_de_non_validite(rapport):
+    html = generer_html(rapport)
+    assert "Motifs de non-validité" in html
+    assert '<td>Date audit = une date</td><td class="num">7</td>' in html
+
+
+def test_case_afficher_aussi_les_validees(rapport):
+    """Comme audit_ppts : non valides seulement par défaut, une case ajoute les validées."""
+    html = generer_html(rapport)
+    assert '<input type="checkbox" id="aussi-validees"> Afficher aussi les validées' in html
+    assert 'checked' not in html.split('id="aussi-validees"')[0][-40:]
+    assert 'data-categorie="non_valides"' in html          # lignes validées masquées au départ
+    assert '.viz-root[data-categorie="non_valides"] tr.l-validee{display:none}' in html
 
 
 def test_boutons_de_copie_par_commune(rapport):
     a = _analyser(generer_html(rapport))
-    assert a.copier == ["13001", "2A004", "75021"]
+    assert a.copier == ["13001", "2A004", "75021"]   # communes ayant des ID non valides
 
 
 def test_donnees_json_de_copie(rapport):
     html = generer_html(rapport)
     bloc = re.search(r'<script id="donnees" type="application/json">(.*?)</script>', html, re.S)
-    assert json.loads(bloc.group(1)) == rapport.ids_vides_par_commune()
+    assert json.loads(bloc.group(1)) == rapport.ids_non_valides_par_commune()
 
 
 def test_echappement_des_valeurs_du_classeur():
@@ -106,12 +134,14 @@ def test_rapport_vide():
     assert _analyser(html).erreurs == []
 
 
-def test_commune_complete_sans_bouton_ni_detail():
+def test_commune_complete_detail_des_lignes_validees():
     c = AuditCommune("13002", "13", ids=[IdErreurAudit("13002_1", [LigneAudit(2, "13002_1", validation="OK")])])
     html = generer_html(RapportAudit(racine="r", communes=[c]))
-    assert 'data-copier="13002"' not in html
-    assert 'class="detail"' not in html
     assert "✅ Complète" in html
+    assert '<tr class="l-validee">' in html and '<tr class="l-non-valide">' not in html
+    assert 'data-copier="13002"' not in html             # aucun ID non valide à copier
+    assert "cocher « Afficher aussi les validées »" in html
+    assert "Aucun ID erreur non valide." in html
 
 
 def test_export_ecrit_le_fichier(rapport, tmp_path):
@@ -120,7 +150,7 @@ def test_export_ecrit_le_fichier(rapport, tmp_path):
     assert os.path.isfile(chemin)
     assert open(chemin, encoding="utf-8").read() == generer_html(rapport)
     assert not os.path.exists(chemin + ".tmp")
-    assert re.fullmatch(r"rapport_validation_finale_\d{8}_\d{4}\.html", cible.name)
+    assert re.fullmatch(r"rapport_audit_vf_\d{8}_\d{4}\.html", cible.name)
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node indisponible")
@@ -150,12 +180,16 @@ def test_etat():
     assert p.etat(AuditCommune("1", "1", statut=StatutAudit.ERREUR)) is p.ETAT_ERREUR
     assert p.etat(AuditCommune("1", "1", statut=StatutAudit.INTROUVABLE)) is p.ETAT_INTROUVABLE
     assert p.etat(AuditCommune("1", "1")) is p.ETAT_SANS_ID
+    nv = LigneAudit(2, "1_1", anomalies=[Anomalie("audit", "Audit vide")])
+    assert p.etat(AuditCommune("1", "1", ids=[IdErreurAudit("1_1", [nv])])) is p.ETAT_A_CORRIGER
+    assert p.etat_ligne(nv) is p.LIGNE_NON_VALIDE and p.etat_ligne(LigneAudit(3, "x")) is p.LIGNE_VALIDEE
 
 
 def test_resume(rapport):
     lignes = p.resume(rapport)
     assert lignes[0].startswith("7 commune(s)")
-    assert "6 sans" in lignes[1]
+    assert "3 validée(s)" in lignes[1] and "8 non valide(s)" in lignes[1]
+    assert "7 ID erreur non valide(s) sur 10" in lignes[1]
 
 
 def test_texte_ids():

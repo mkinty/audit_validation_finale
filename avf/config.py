@@ -1,6 +1,8 @@
 """Réglages de l'outil, conservés d'un lancement à l'autre (``config_audit_vf.json``).
 
-    racine          → dossier racine des audits
+    source          → « local » (dossier racine) ou « sharepoint » (lien SharePoint)
+    racine          → dossier racine des audits (source locale)
+    lien_sharepoint → lien SharePoint du dossier racine (source SharePoint)
     communes        → dernière sélection de communes
     colonnes        → libellés des colonnes auditées (Validation finale, Audit…)
     regles          → règles de mise à jour, au format de complete_excel_files
@@ -10,6 +12,7 @@
     ecrire_via_excel→ écriture via Excel (co-édition SharePoint) si disponible
     reauditer       → ré-auditer les communes mises à jour pour rafraîchir le rapport
     dossier_export  → dernier dossier d'export du rapport HTML
+    paralleles      → communes lues / préparées en même temps (threads, 1 à 16)
 
 Un fichier absent ou illisible redonne les valeurs par défaut ; une clé
 manquante est complétée par sa valeur par défaut.
@@ -26,10 +29,15 @@ from sna.models.regles import ReglesConfig
 from .chemins import CONFIG_FILE
 from .models.colonnes import ColonnesAudit
 
+PARALLELES_DEFAUT = 4
+PARALLELES_MAX = 16
+
 
 @dataclass
 class Parametres:
+    source: str = "local"
     racine: str = ""
+    lien_sharepoint: str = ""
     communes: list[str] = field(default_factory=list)
     colonnes: ColonnesAudit = field(default_factory=ColonnesAudit)
     regles: ReglesConfig = field(default_factory=ReglesConfig.defaut)
@@ -37,10 +45,13 @@ class Parametres:
     ecrire_via_excel: bool = True
     reauditer: bool = True
     dossier_export: str = ""
+    paralleles: int = PARALLELES_DEFAUT
 
     def to_dict(self) -> dict:
         return {
+            "source": self.source,
             "racine": self.racine,
+            "lien_sharepoint": self.lien_sharepoint,
             "communes": list(self.communes),
             "colonnes": self.colonnes.to_dict(),
             "regles": self.regles.to_dict(),
@@ -48,6 +59,7 @@ class Parametres:
             "ecrire_via_excel": self.ecrire_via_excel,
             "reauditer": self.reauditer,
             "dossier_export": self.dossier_export,
+            "paralleles": self.paralleles,
         }
 
     @staticmethod
@@ -55,7 +67,9 @@ class Parametres:
         data = data if isinstance(data, dict) else {}
         defaut = Parametres()
         return Parametres(
+            source="sharepoint" if data.get("source") == "sharepoint" else "local",
             racine=str(data.get("racine") or ""),
+            lien_sharepoint=str(data.get("lien_sharepoint") or "").strip(),
             communes=_liste(data.get("communes")),
             colonnes=ColonnesAudit.from_dict(data.get("colonnes")),
             regles=_regles(data.get("regles")),
@@ -63,6 +77,7 @@ class Parametres:
             ecrire_via_excel=bool(data.get("ecrire_via_excel", defaut.ecrire_via_excel)),
             reauditer=bool(data.get("reauditer", defaut.reauditer)),
             dossier_export=str(data.get("dossier_export") or ""),
+            paralleles=_paralleles(data.get("paralleles", defaut.paralleles)),
         )
 
 
@@ -91,6 +106,13 @@ def _liste(valeur) -> list[str]:
     if not isinstance(valeur, list):
         return []
     return [str(v) for v in valeur if str(v).strip()]
+
+
+def _paralleles(valeur) -> int:
+    try:
+        return min(max(int(valeur), 1), PARALLELES_MAX)
+    except (TypeError, ValueError):
+        return PARALLELES_DEFAUT
 
 
 def _regles(data) -> ReglesConfig:

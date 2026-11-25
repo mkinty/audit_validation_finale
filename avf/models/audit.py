@@ -1,10 +1,15 @@
 """Résultats de l'audit : ligne, ID erreur, commune, rapport complet.
 
-Règle métier : un **ID erreur** est « renseigné » quand sa cellule
-« Validation finale » contient une valeur (espaces seuls = vide). Si un même
-ID apparaît sur plusieurs lignes, il n'est renseigné que si **toutes** ses
-lignes le sont — la mise à jour ciblant toutes les lignes d'un ID, c'est la
-seule définition qui ne laisse jamais de ligne vide derrière elle.
+Règle métier : chaque **ligne** portant un ID erreur est contrôlée sur ses
+quatre colonnes (Audit, Date audit, Auditeur, Validation finale — critères
+dans ``models.colonnes`` et ``services.controle``). Une ligne qui les respecte
+toutes est **validée** ; sinon elle est **non valide**, avec le motif de chaque
+critère non respecté.
+
+Un ID erreur pouvant apparaître sur plusieurs lignes, il est **validé** si
+toutes ses lignes le sont, **non valide** dès qu'une de ses lignes ne l'est
+pas : la mise à jour réécrivant toutes les lignes d'un ID, c'est la seule
+définition qui ne laisse jamais de ligne non valide derrière elle.
 
 Ces objets ne dépendent d'aucune bibliothèque externe ni de l'interface.
 """
@@ -17,6 +22,14 @@ from datetime import datetime
 from enum import Enum
 
 from .colonnes import ColonnesAudit
+from .source import SourceAudit
+
+# Critères contrôlés, dans l'ordre d'affichage.
+CRITERES = ("audit", "date_audit", "auditeur", "validation")
+
+# Ce que l'on affiche ou copie : les lignes non valides, les validées, ou toutes.
+NON_VALIDES, VALIDEES, TOUTES = "non_valides", "validees", "toutes"
+CATEGORIES = (NON_VALIDES, VALIDEES, TOUTES)
 
 
 class StatutAudit(Enum):
@@ -28,8 +41,16 @@ class StatutAudit(Enum):
 
 
 def est_vide(valeur) -> bool:
-    """Vrai si une cellule est considérée comme non renseignée."""
+    """Vrai si une cellule est considérée comme non renseignée (espaces seuls = vide)."""
     return valeur is None or str(valeur).strip() == ""
+
+
+@dataclass(frozen=True)
+class Anomalie:
+    """Un critère non respecté par une ligne."""
+
+    critere: str   # l'un de CRITERES
+    message: str   # ex. « Audit « Fait » ≠ OK / KO »
 
 
 @dataclass
@@ -42,10 +63,19 @@ class LigneAudit:
     audit: str = ""
     date_audit: str = ""
     auditeur: str = ""
+    anomalies: list[Anomalie] = field(default_factory=list)
 
     @property
-    def validee(self) -> bool:
-        return not est_vide(self.validation)
+    def valide(self) -> bool:
+        return not self.anomalies
+
+    @property
+    def motifs(self) -> str:
+        """Motifs de non-validité, lisibles (vide pour une ligne validée)."""
+        return " · ".join(a.message for a in self.anomalies)
+
+    def dans(self, categorie: str) -> bool:
+        return categorie == TOUTES or (self.valide if categorie == VALIDEES else not self.valide)
 
 
 @dataclass
@@ -56,18 +86,25 @@ class IdErreurAudit:
     lignes: list[LigneAudit] = field(default_factory=list)
 
     @property
-    def renseigne(self) -> bool:
-        """Vrai si toutes les lignes de l'ID ont une « Validation finale »."""
-        return bool(self.lignes) and all(l.validee for l in self.lignes)
+    def valide(self) -> bool:
+        """Vrai si toutes les lignes de l'ID sont validées."""
+        return bool(self.lignes) and all(l.valide for l in self.lignes)
 
     @property
     def doublon(self) -> bool:
         return len(self.lignes) > 1
 
     @property
+    def lignes_non_valides(self) -> list[LigneAudit]:
+        return [l for l in self.lignes if not l.valide]
+
+    @property
     def reference(self) -> LigneAudit:
-        """Ligne affichée : la première non validée, à défaut la première."""
-        return next((l for l in self.lignes if not l.validee), self.lignes[0])
+        """Ligne mise en avant : la première non valide, à défaut la première."""
+        return next((l for l in self.lignes if not l.valide), self.lignes[0])
+
+    def dans(self, categorie: str) -> bool:
+        return categorie == TOUTES or (self.valide if categorie == VALIDEES else not self.valide)
 
 
 @dataclass
@@ -84,39 +121,66 @@ class AuditCommune:
     nb_lignes_lues: int = 0
     duree: float = 0.0
 
-    # ── Comptages ─────────────────────────────────────────────────
+    # ── Lignes ────────────────────────────────────────────────────
     @property
-    def nb_ids(self) -> int:
-        return len(self.ids)
+    def lignes(self) -> list[LigneAudit]:
+        """Toutes les lignes portant un ID erreur, dans l'ordre du fichier."""
+        return sorted((l for i in self.ids for l in i.lignes), key=lambda l: l.ligne)
 
-    @property
-    def nb_renseignes(self) -> int:
-        return sum(1 for i in self.ids if i.renseigne)
-
-    @property
-    def nb_vides(self) -> int:
-        return self.nb_ids - self.nb_renseignes
+    def lignes_de(self, categorie: str = NON_VALIDES) -> list[LigneAudit]:
+        return [l for l in self.lignes if l.dans(categorie)]
 
     @property
     def nb_lignes(self) -> int:
         return sum(len(i.lignes) for i in self.ids)
 
     @property
+    def nb_lignes_valides(self) -> int:
+        return sum(1 for i in self.ids for l in i.lignes if l.valide)
+
+    @property
+    def nb_lignes_non_valides(self) -> int:
+        return self.nb_lignes - self.nb_lignes_valides
+
+    # ── ID erreur ─────────────────────────────────────────────────
+    @property
+    def nb_ids(self) -> int:
+        return len(self.ids)
+
+    @property
+    def nb_ids_valides(self) -> int:
+        return sum(1 for i in self.ids if i.valide)
+
+    @property
+    def nb_ids_non_valides(self) -> int:
+        return self.nb_ids - self.nb_ids_valides
+
+    @property
     def nb_doublons(self) -> int:
         return sum(1 for i in self.ids if i.doublon)
 
+    def ids_de(self, categorie: str = NON_VALIDES) -> list[str]:
+        """ID erreur de la catégorie (``NON_VALIDES`` : au moins une ligne non valide)."""
+        return [i.id_erreur for i in self.ids if i.dans(categorie)] if self.lisible else []
+
+    @property
+    def ids_non_valides(self) -> list[str]:
+        return self.ids_de(NON_VALIDES)
+
+    # ── Synthèse ──────────────────────────────────────────────────
     @property
     def taux(self) -> float | None:
-        """Part des ID renseignés (0 → 1), ``None`` sans aucun ID."""
-        return self.nb_renseignes / self.nb_ids if self.nb_ids else None
+        """Part des lignes validées (0 → 1), ``None`` sans aucune ligne."""
+        return self.nb_lignes_valides / self.nb_lignes if self.nb_lignes else None
 
-    @property
-    def ids_vides(self) -> list[str]:
-        return [i.id_erreur for i in self.ids if not i.renseigne]
-
-    @property
-    def details_vides(self) -> list[IdErreurAudit]:
-        return [i for i in self.ids if not i.renseigne]
+    def par_critere(self) -> dict[str, int]:
+        """Nombre de lignes ne respectant pas chaque critère."""
+        comptes = dict.fromkeys(CRITERES, 0)
+        for i in self.ids:
+            for l in i.lignes:
+                for critere in {a.critere for a in l.anomalies}:
+                    comptes[critere] = comptes.get(critere, 0) + 1
+        return comptes
 
     @property
     def lisible(self) -> bool:
@@ -124,8 +188,8 @@ class AuditCommune:
 
     @property
     def complete(self) -> bool:
-        """Fichier lu et aucun ID sans validation finale."""
-        return self.lisible and self.nb_vides == 0
+        """Fichier lu et toutes ses lignes validées."""
+        return self.lisible and self.nb_lignes_non_valides == 0
 
 
 @dataclass
@@ -138,6 +202,11 @@ class RapportAudit:
     colonne_id: str = "ID erreur"
     date: datetime = field(default_factory=datetime.now)
     duree: float = 0.0
+    source: SourceAudit | None = None   # None : dossier local (rapports antérieurs, tests)
+
+    @property
+    def libelle_source(self) -> str:
+        return self.source.libelle if self.source else "Dossier local"
 
     # ── Totaux ────────────────────────────────────────────────────
     @property
@@ -153,49 +222,71 @@ class RapportAudit:
         return len(self.communes)
 
     @property
+    def nb_lignes(self) -> int:
+        return sum(c.nb_lignes for c in self.communes)
+
+    @property
+    def nb_lignes_valides(self) -> int:
+        return sum(c.nb_lignes_valides for c in self.communes)
+
+    @property
+    def nb_lignes_non_valides(self) -> int:
+        return sum(c.nb_lignes_non_valides for c in self.communes)
+
+    @property
     def nb_ids(self) -> int:
         return sum(c.nb_ids for c in self.communes)
 
     @property
-    def nb_renseignes(self) -> int:
-        return sum(c.nb_renseignes for c in self.communes)
+    def nb_ids_valides(self) -> int:
+        return sum(c.nb_ids_valides for c in self.communes)
 
     @property
-    def nb_vides(self) -> int:
-        return sum(c.nb_vides for c in self.communes)
+    def nb_ids_non_valides(self) -> int:
+        return sum(c.nb_ids_non_valides for c in self.communes)
 
     @property
     def taux(self) -> float | None:
-        return self.nb_renseignes / self.nb_ids if self.nb_ids else None
+        """Part des lignes validées."""
+        return self.nb_lignes_valides / self.nb_lignes if self.nb_lignes else None
 
     @property
-    def communes_a_traiter(self) -> list[AuditCommune]:
-        """Communes lues ayant au moins un ID sans validation finale."""
-        return [c for c in self.lues if c.nb_vides]
+    def communes_a_corriger(self) -> list[AuditCommune]:
+        """Communes lues ayant au moins une ligne non valide."""
+        return [c for c in self.lues if c.nb_lignes_non_valides]
 
     @property
     def communes_completes(self) -> list[AuditCommune]:
         return [c for c in self.lues if c.complete]
 
-    def ids_vides_par_commune(self) -> dict[str, list[str]]:
-        """``{commune: [ID erreur sans validation finale]}`` — entrée de la mise à jour."""
-        return {c.commune: c.ids_vides for c in self.communes if c.lisible and c.nb_vides}
+    def ids_non_valides_par_commune(self) -> dict[str, list[str]]:
+        """``{commune: [ID erreur non valides]}`` — entrée de la mise à jour."""
+        return {c.commune: c.ids_non_valides for c in self.communes if c.ids_non_valides}
 
-    def tous_ids_vides(self) -> list[str]:
-        return [i for c in self.communes for i in (c.ids_vides if c.lisible else [])]
+    def ids_de(self, categorie: str = NON_VALIDES) -> list[str]:
+        return [i for c in self.communes for i in c.ids_de(categorie)]
+
+    def par_critere(self) -> dict[str, int]:
+        """Lignes non valides par critère non respecté (une ligne peut en cumuler plusieurs)."""
+        total = dict.fromkeys(CRITERES, 0)
+        for c in self.communes:
+            for critere, n in c.par_critere().items():
+                total[critere] = total.get(critere, 0) + n
+        return total
 
     def par_departement(self) -> "OrderedDict[str, dict[str, int]]":
-        """Synthèse ``{département: {communes, ids, renseignes, vides, erreurs}}``."""
+        """Synthèse ``{département: {communes, ids, lignes, valides, non_valides, erreurs}}`` (lignes)."""
         synthese: OrderedDict[str, dict[str, int]] = OrderedDict()
         for c in sorted(self.communes, key=lambda x: (x.departement, x.commune)):
             ligne = synthese.setdefault(
                 c.departement,
-                {"communes": 0, "ids": 0, "renseignes": 0, "vides": 0, "erreurs": 0},
+                {"communes": 0, "ids": 0, "lignes": 0, "valides": 0, "non_valides": 0, "erreurs": 0},
             )
             ligne["communes"] += 1
             ligne["ids"] += c.nb_ids
-            ligne["renseignes"] += c.nb_renseignes
-            ligne["vides"] += c.nb_vides
+            ligne["lignes"] += c.nb_lignes
+            ligne["valides"] += c.nb_lignes_valides
+            ligne["non_valides"] += c.nb_lignes_non_valides
             ligne["erreurs"] += 0 if c.lisible else 1
         return synthese
 

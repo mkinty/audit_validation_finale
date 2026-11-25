@@ -1,13 +1,25 @@
-"""Noms des colonnes lues dans l'onglet « Audit » de chaque fichier.
+"""Colonnes contrôlées dans l'onglet « Audit », et valeurs qu'elles doivent contenir.
 
 La colonne des ID erreur n'est pas portée ici : elle est partagée avec les
 règles de mise à jour (``sna.models.regles.ReglesConfig.colonne_id``), pour que
 l'audit et la mise à jour sélectionnent toujours les lignes de la même façon.
+
+Critères d'une ligne **validée** (cf. ``services.controle``) :
+
+    Validation finale  ∈ valeurs_validation   (défaut : OK)
+    Audit              ∈ valeurs_audit        (défaut : OK, KO)
+    Date audit         renseignée et lisible comme une date (même saisie en texte)
+    Auditeur           renseigné
+
+Les valeurs sont comparées sans tenir compte de la casse ni des espaces autour.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+
+VALEURS_VALIDATION_DEFAUT = ("OK",)
+VALEURS_AUDIT_DEFAUT = ("OK", "KO")
 
 
 @dataclass
@@ -18,10 +30,15 @@ class ColonnesAudit:
     audit: str = "Audit"
     date_audit: str = "Date audit"
     auditeur: str = "Auditeur"
+    valeurs_validation: tuple[str, ...] = VALEURS_VALIDATION_DEFAUT
+    valeurs_audit: tuple[str, ...] = VALEURS_AUDIT_DEFAUT
 
-    def complementaires(self) -> dict[str, str]:
-        """Colonnes affichées à titre d'information : ``{clé: libellé}``."""
-        return {"audit": self.audit, "date_audit": self.date_audit, "auditeur": self.auditeur}
+    def controlees(self) -> dict[str, str]:
+        """Les quatre colonnes contrôlées : ``{clé: libellé}``, dans l'ordre d'affichage."""
+        return {
+            "audit": self.audit, "date_audit": self.date_audit,
+            "auditeur": self.auditeur, "validation": self.validation,
+        }
 
     def to_dict(self) -> dict:
         return {
@@ -29,6 +46,8 @@ class ColonnesAudit:
             "audit": self.audit,
             "date_audit": self.date_audit,
             "auditeur": self.auditeur,
+            "valeurs_validation": list(self.valeurs_validation),
+            "valeurs_audit": list(self.valeurs_audit),
         }
 
     @staticmethod
@@ -44,4 +63,19 @@ class ColonnesAudit:
             audit=lire("audit"),
             date_audit=lire("date_audit"),
             auditeur=lire("auditeur"),
+            valeurs_validation=parser_valeurs(data.get("valeurs_validation")) or VALEURS_VALIDATION_DEFAUT,
+            valeurs_audit=parser_valeurs(data.get("valeurs_audit")) or VALEURS_AUDIT_DEFAUT,
         )
+
+
+def parser_valeurs(valeur) -> tuple[str, ...]:
+    """``"OK, KO"`` ou ``["OK", "KO"]`` → ``("OK", "KO")`` (vides et doublons retirés)."""
+    if valeur is None:
+        return ()
+    morceaux = valeur if isinstance(valeur, (list, tuple)) else str(valeur).replace(";", ",").split(",")
+    vus: dict[str, str] = {}
+    for m in morceaux:
+        texte = str(m).strip()
+        if texte and texte.casefold() not in vus:
+            vus[texte.casefold()] = texte
+    return tuple(vus.values())

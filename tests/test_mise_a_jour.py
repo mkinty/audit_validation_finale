@@ -75,7 +75,7 @@ def test_preparer_regles_ne_touche_pas_recopie_ni_effacement():
 def test_groupes_depuis_rapport(racine):
     rapport = auditer_communes(COMMUNES, racine)
     assert groupes_depuis_rapport(rapport) == {
-        "13001": ["13001_2", "13001_3", "13001_5"],
+        "13001": ["13001_2", "13001_3", "13001_4", "13001_5"],
         "2A004": ["2A004_1", "2A004_2"],
         "75021": ["75021_1"],
     }
@@ -83,7 +83,7 @@ def test_groupes_depuis_rapport(racine):
 
 
 # ── De bout en bout ───────────────────────────────────────────────
-def test_mise_a_jour_complete_les_ids_vides(racine, tmp_path):
+def test_mise_a_jour_corrige_les_ids_non_valides(racine, tmp_path):
     rapport = auditer_communes(COMMUNES, racine)
     groupes = groupes_depuis_rapport(rapport)
     regles = preparer_regles(ReglesConfig.defaut(), "Date audit", True, aujourd_hui=date(2026, 11, 24))
@@ -102,7 +102,7 @@ def test_mise_a_jour_complete_les_ids_vides(racine, tmp_path):
     assert par_commune["75021"].statut is Statut.ERREUR
     assert "conflit" in par_commune["75021"].message
     assert bilan.echecs == {"75021_1": par_commune["75021"].message}
-    assert sorted(bilan.reussis) == ["13001_2", "13001_3", "13001_5", "2A004_1", "2A004_2"]
+    assert sorted(bilan.reussis) == ["13001_2", "13001_3", "13001_4", "13001_5", "2A004_1", "2A004_2"]
     assert bilan.nb_en_attente == 1
     assert list(json.load(open(attente_json, encoding="utf-8"))) == ["75021_1"]
     assert len(resultats) == 3 and etapes
@@ -111,12 +111,12 @@ def test_mise_a_jour_complete_les_ids_vides(racine, tmp_path):
     par_id = {}
     for l in lignes:
         par_id.setdefault(l["ID erreur"], []).append(l)
-    # ID déjà validés : inchangés
+    # ID validé : inchangé
     assert par_id["13001_1"][0]["Auditeur"] == "Alice"
     assert par_id["13001_1"][0]["Date audit"] == datetime(2026, 3, 12)
-    assert par_id["13001_4"][0]["Validation finale"] == "Validé"
-    # ID vides : les 4 colonnes complétées, sur toutes leurs lignes
-    for ident in ("13001_2", "13001_3", "13001_5"):
+    # ID non valides (dont 13001_4, Validation finale « Validé ») : les 4 colonnes
+    # réécrites, sur toutes leurs lignes
+    for ident in ("13001_2", "13001_3", "13001_4", "13001_5"):
         for l in par_id[ident]:
             assert l["Audit"] == "OK"
             assert l["Date audit"] == datetime(2026, 11, 24)   # vraie date Excel
@@ -129,9 +129,10 @@ def test_mise_a_jour_complete_les_ids_vides(racine, tmp_path):
     assert all(l["Validation finale"] == "OK" for l in _valeurs(
         os.path.join(racine, "Dep2A", "2A004", "audit_2A004.xlsx"), "audit"))
 
-    # Ré-audit : plus aucun ID vide hors conflit
+    # Ré-audit : plus aucun ID non valide hors conflit
     apres = auditer_communes(COMMUNES, racine)
-    assert apres.ids_vides_par_commune() == {"75021": ["75021_1"]}
+    assert apres.ids_non_valides_par_commune() == {"75021": ["75021_1"]}
+    assert apres.commune("13001").complete
 
 
 def test_simulation_n_ecrit_rien(racine, tmp_path):
@@ -143,11 +144,12 @@ def test_simulation_n_ecrit_rien(racine, tmp_path):
         groupes_depuis_rapport(rapport), ReglesConfig.defaut(), racine,
         simuler=True, fichier_attente=attente_json,
     )
-    # 13001_2 : 4 cellules · 13001_3 : 4 · 13001_5 : 3 (ligne déjà validée) + 4
-    assert bilan.simulation and bilan.nb_modifications == 15
+    # 13001_2 : 4 cellules · 13001_3 : 4 (KO → OK) · 13001_4 : 3 (Audit déjà OK)
+    # · 13001_5 : 3 (Validation finale déjà OK) + 4
+    assert bilan.simulation and bilan.nb_modifications == 18
     assert open(chemin, "rb").read() == avant[1]
     assert not os.path.exists(attente_json)
-    assert auditer_communes(["13001"], racine).nb_vides == 3
+    assert auditer_communes(["13001"], racine).nb_ids_non_valides == 4
 
 
 def test_meme_resultat_que_le_moteur_appele_directement(racine, tmp_path):
@@ -249,6 +251,34 @@ def test_mise_a_jour_via_excel_reel(racine):
     assert resultat.statut is Statut.SUCCES, resultat.message
     assert resultat.ids_non_verifies == []
     lignes = _valeurs(os.path.join(racine, "Dep13", "13001", "audit_13001.xlsx"))
-    assert [l["Validation finale"] for l in lignes[:6]] == ["OK", "OK", "OK", "Validé", "OK", "OK"]
+    assert [l["Validation finale"] for l in lignes[:6]] == ["OK"] * 6
     assert lignes[1]["Date audit"] == datetime(2026, 11, 24)
-    assert auditer_communes(["13001"], racine).nb_vides == 0
+    assert auditer_communes(["13001"], racine).commune("13001").complete
+
+
+def test_mise_a_jour_parallele_identique(racine, tmp_path):
+    import shutil
+    copie = str(tmp_path / "copie")
+    shutil.copytree(racine, copie)
+    regles = preparer_regles(ReglesConfig.defaut(), aujourd_hui=date(2026, 11, 24))
+    seq = mettre_a_jour(groupes_depuis_rapport(auditer_communes(COMMUNES, racine)), regles, racine)
+    par = mettre_a_jour(groupes_depuis_rapport(auditer_communes(COMMUNES, copie)), regles, copie,
+                        paralleles=4)
+    assert [(r.commune, r.statut, r.nb_modifications) for r in par.resultats] == \
+           [(r.commune, r.statut, r.nb_modifications) for r in seq.resultats]
+    assert par.echecs.keys() == seq.echecs.keys() and sorted(par.reussis) == sorted(seq.reussis)
+    assert not par.interrompu
+    assert auditer_communes(COMMUNES, copie).ids_non_valides_par_commune() == {"75021": ["75021_1"]}
+
+
+def test_arret_de_la_mise_a_jour(racine, tmp_path):
+    attente_json = str(tmp_path / "attente.json")
+    groupes = groupes_depuis_rapport(auditer_communes(COMMUNES, racine))
+    appels = iter([False, True, True, True])
+    bilan = mettre_a_jour(groupes, ReglesConfig.defaut(), racine, fichier_attente=attente_json,
+                          doit_arreter=lambda: next(appels))
+    assert bilan.communes_traitees == ["13001"] and bilan.interrompu
+    assert bilan.nb_communes_demandees == 3
+    # Les communes non commencées ne sont ni en échec ni réussies : intactes et hors attente
+    assert bilan.echecs == {} and bilan.nb_en_attente == 0
+    assert set(auditer_communes(COMMUNES, racine).ids_non_valides_par_commune()) == {"2A004", "75021"}

@@ -22,12 +22,30 @@ Avant tout traitement d'une commune, une copie de conflit OneDrive/SharePoint
 restée dans son dossier (cf. ``services.fichiers.detecter_fichiers_conflit``)
 fait échouer la commune explicitement, sans rien ouvrir ni écrire : laquelle
 des deux versions garder reste un choix humain, pas quelque chose à deviner.
+
+``paralleles`` (facultatif, 1 par défaut : traitement séquentiel, identique à
+complete_excel_files) traite plusieurs communes à la fois sur un pool de
+threads. Les communes sont indépendantes (un fichier chacune) ; le gain vient
+des entrées/sorties qui se recouvrent (fichiers OneDrive à rapatrier, lecture
+rapide du XML, décompression). Avec ``session_excel``, la préparation de
+chaque commune (recherche du fichier, copies de conflit, repérage rapide) se
+fait en parallèle pendant qu'Excel écrit la précédente ; les écritures Excel,
+elles, restent une à une (une seule instance, cf. ``excel_com.SessionExcel``).
+``on_progression`` et ``on_resultat`` sont alors appelés depuis les threads du
+pool, un à la fois, au fil des communes terminées ; ``on_etape`` peut l'être
+depuis plusieurs threads. La liste renvoyée garde l'ordre des communes demandées.
+
+``doit_arreter`` (facultatif) est consulté avant chaque commune : les communes
+non commencées sont abandonnées (absentes des résultats), celles en cours vont
+à leur terme — un fichier n'est jamais laissé à moitié écrit.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 import os
+import threading
 import time
 
 from ..models.base import ResultatCommune, Statut
@@ -51,6 +69,9 @@ def traiter_communes(
     on_resultat: CallbackResultat | None = None,
     on_etape: CallbackEtape | None = None,
     session_excel=None,
+    paralleles: int = 1,
+    doit_arreter: Callable[[], bool] | None = None,
+    prereperage: bool = True,
 ) -> list[ResultatCommune]:
     """Applique les règles aux lignes des ID erreur, commune par commune.
 
@@ -65,29 +86,76 @@ def traiter_communes(
         session_excel: une ``services.excel_com.SessionExcel`` déjà ouverte,
             pour écrire via Excel plutôt que par réécriture directe du
             fichier. ``None`` (défaut) ou ``simuler=True`` → réécriture directe.
+        paralleles: nombre de communes traitées en même temps (1 : séquentiel).
+        doit_arreter: consulté avant chaque commune pour interrompre le lot.
+        prereperage: avec ``session_excel``, vérifier d'abord dans le fichier
+            (lecture rapide, sans Excel) qu'un des ID y figure. ``False`` quand
+            le fichier parcouru n'est pas celui qu'Excel ouvrira (audit depuis
+            SharePoint via une bibliothèque synchronisée : la copie locale peut
+            différer du serveur) — Excel est alors toujours ouvert.
 
     Returns:
-        La liste des :class:`ResultatCommune`, dans l'ordre de traitement.
+        La liste des :class:`ResultatCommune`, dans l'ordre des communes demandées.
     """
     communes = list(groupes)
     total = len(communes)
-    resultats: list[ResultatCommune] = []
-
     _notifier_progression(on_progression, 0, total, "Démarrage...")
 
-    for index, commune in enumerate(communes, start=1):
-        ids = list(groupes[commune])
-        _notifier_progression(
-            on_progression, index, total,
-            f"{commune} ({len(ids)} ID erreur)",
+    if paralleles > 1 and total > 1:
+        resultats = _traiter_en_parallele(
+            communes, groupes, config, racine, simuler, on_progression, on_resultat, on_etape,
+            session_excel, paralleles, doit_arreter, prereperage,
         )
-        resultat = _traiter_une_commune(commune, ids, config, racine, simuler, on_etape, session_excel)
-        resultats.append(resultat)
-        if on_resultat is not None:
-            on_resultat(resultat)
+    else:
+        resultats = []
+        for index, commune in enumerate(communes, start=1):
+            if doit_arreter is not None and doit_arreter():
+                break
+            ids = list(groupes[commune])
+            _notifier_progression(
+                on_progression, index, total,
+                f"{commune} ({len(ids)} ID erreur)",
+            )
+            resultat = _traiter_une_commune(
+                commune, ids, config, racine, simuler, on_etape, session_excel, prereperage,
+            )
+            resultats.append(resultat)
+            if on_resultat is not None:
+                on_resultat(resultat)
 
     _notifier_progression(on_progression, total, total, "Terminé")
     return resultats
+
+
+def _traiter_en_parallele(
+    communes, groupes, config, racine, simuler, on_progression, on_resultat, on_etape,
+    session_excel, paralleles, doit_arreter, prereperage=True,
+) -> list[ResultatCommune]:
+    """Pool de threads ; résultats dans l'ordre des communes demandées."""
+    total = len(communes)
+    resultats: list[ResultatCommune | None] = [None] * total
+    verrou = threading.Lock()
+    faits = 0
+
+    def traiter(rang: int, commune: str) -> None:
+        nonlocal faits
+        if doit_arreter is not None and doit_arreter():
+            return
+        ids = list(groupes[commune])
+        resultat = _traiter_une_commune(
+            commune, ids, config, racine, simuler, on_etape, session_excel, prereperage,
+        )
+        with verrou:   # callbacks un à la fois, dans l'ordre de fin
+            faits += 1
+            resultats[rang] = resultat
+            _notifier_progression(on_progression, faits, total, f"{commune} ({len(ids)} ID erreur)")
+            if on_resultat is not None:
+                on_resultat(resultat)
+
+    with ThreadPoolExecutor(max_workers=min(paralleles, total), thread_name_prefix="sna-commune") as pool:
+        for future in [pool.submit(traiter, rang, c) for rang, c in enumerate(communes)]:
+            future.result()   # _traiter_une_commune ne lève pas : seule une erreur de callback remonte
+    return [r for r in resultats if r is not None]
 
 
 def _traiter_une_commune(
@@ -98,6 +166,7 @@ def _traiter_une_commune(
     simuler: bool,
     on_etape: CallbackEtape | None,
     session_excel,
+    prereperage: bool = True,
 ) -> ResultatCommune:
     """Traite une seule commune et renvoie son résultat (ne lève jamais)."""
     def etape(message: str) -> None:
@@ -128,7 +197,7 @@ def _traiter_une_commune(
     depart = time.perf_counter()
     try:
         if session_excel is not None and not simuler:
-            bilan = _appliquer_via_excel(session_excel, fichier, config, ids, etape)
+            bilan = _appliquer_via_excel(session_excel, fichier, config, ids, etape, prereperage)
         else:
             bilan = appliquer_regles(fichier, config, ids, simuler=simuler, on_etape=etape)
 
@@ -156,13 +225,15 @@ def _traiter_une_commune(
         )
 
 
-def _appliquer_via_excel(session_excel, fichier, config, ids, etape):
+def _appliquer_via_excel(session_excel, fichier, config, ids, etape, prereperage=True):
     """Écrit via Excel, après une pré-vérification bon marché (sans l'ouvrir).
 
     Si aucun des ID demandés n'apparaît dans le fichier (repérage rapide,
     comme pour la réécriture directe), inutile de payer le coût d'une session
     Excel pour ne rien y faire : le résultat du repérage est renvoyé tel quel.
     """
+    if not prereperage:
+        return session_excel.appliquer_regles(fichier, config, ids, on_etape=etape)
     pre_bilan = reperer_ids(fichier, config, ids, on_etape=etape)
     if not pre_bilan.ids_trouves:
         etape(f"aucune ligne concernée sur {pre_bilan.nb_lignes_lues} lue(s) — Excel non ouvert")

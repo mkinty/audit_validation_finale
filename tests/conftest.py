@@ -33,11 +33,12 @@ def ecrire_audit(
 def racine(tmp_path):
     """Arborescence de test :
 
-    Dep13/13001  : 5 ID — 2 renseignés, 3 vides (dont espaces seuls, et un
-                   ID en double ligne dont une seule est validée)
-    Dep13/13002  : 2 ID, tous renseignés
+    Dep13/13001  : 5 ID, 6 lignes — 1 ligne validée (13001_1), 5 non valides :
+                   13001_2 tout vide · 13001_3 Audit KO mais date et VF (espaces) vides
+                   · 13001_4 VF « Validé » ≠ OK · 13001_5 sur deux lignes, aucune valide
+    Dep13/13002  : 2 ID, tous validés (dont une date saisie en texte, « ok  »)
     Dep13/13003  : dossier sans fichier audit
-    Dep2A/2A004  : 2 ID vides, onglet « AUDIT » qui n'est pas le premier
+    Dep2A/2A004  : 2 ID non valides, onglet « AUDIT » qui n'est pas le premier
     Dep75/75020  : colonne « Validation finale » absente
     Dep75/75021  : deux fichiers audit (copie de conflit)
     """
@@ -59,7 +60,7 @@ def racine(tmp_path):
         os.path.join(r, "Dep13", "13002", "audit_13002.xlsx"),
         [
             ["13002_1", "x", "OK", datetime(2026, 2, 1), "Carl", "OK"],
-            ["13002_2", "y", "OK", datetime(2026, 2, 2), "Carl", 1],
+            ["13002_2", "y", "ok", "15/02/2026", "Carl", "ok "],   # date en texte, casse/espaces
         ],
     )
     os.makedirs(os.path.join(r, "Dep13", "13003"))

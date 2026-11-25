@@ -10,9 +10,11 @@ même résultat, plus lent.
 Comme pour la mise à jour, c'est toujours l'onglet nommé « Audit » qui est lu
 (casse et espaces ignorés), jamais l'onglet actif.
 
-Une colonne **obligatoire** absente (ID erreur, Validation finale) fait échouer
-la lecture (:class:`ColonneAbsente`) ; une colonne **informative** absente
-(Audit, Date audit, Auditeur) est seulement signalée en avertissement.
+Les cinq colonnes sont **obligatoires** : les quatre colonnes contrôlées
+(Audit, Date audit, Auditeur, Validation finale) font chacune partie des
+critères de validité d'une ligne. Une colonne absente fait échouer la lecture
+(:class:`ColonneAbsente`, qui les cite toutes) plutôt que de déclarer à tort
+toutes les lignes non valides.
 """
 
 from __future__ import annotations
@@ -44,7 +46,7 @@ _SERIE_MIN, _SERIE_MAX = 20_000, 80_000
 
 
 class ColonneAbsente(LookupError):
-    """Une colonne obligatoire (ID erreur, Validation finale) est absente."""
+    """Une colonne obligatoire (ID erreur ou colonne contrôlée) est absente."""
 
 
 @dataclass
@@ -63,7 +65,7 @@ def lire_audit(
     """Lit les lignes portant un ID erreur et leurs colonnes d'audit.
 
     Raises:
-        ColonneAbsente: colonne des ID erreur ou « Validation finale » absente.
+        ColonneAbsente: colonne des ID erreur ou colonne contrôlée absente.
         sna.services.colonnes_excel.OngletIntrouvable: aucun onglet « Audit ».
     """
     try:
@@ -79,9 +81,7 @@ def _lire_rapide(chemin, colonne_id, colonnes, ligne_entete) -> LectureAudit:
     entetes = lire_entetes(chemin, ligne_entete)
     if not entetes:
         raise LectureImpossible("ligne d'en-tête vide")
-    index_id, index_vf, index_info, avertissements = _resoudre(
-        entetes, colonne_id, colonnes,
-    )
+    index_id, index_info, avertissements = _resoudre(entetes, colonne_id, colonnes)
 
     ids: dict[int, str] = {}
     derniere = ligne_entete
@@ -90,7 +90,7 @@ def _lire_rapide(chemin, colonne_id, colonnes, ligne_entete) -> LectureAudit:
         if str(valeur).strip():
             ids[ligne] = str(valeur).strip()
 
-    valeurs = {"validation": _colonne(chemin, index_vf, ligne_entete, ids)}
+    valeurs = {}
     for cle, (index, en_date) in index_info.items():
         valeurs[cle] = _colonne(chemin, index, ligne_entete, ids, en_date=en_date)
 
@@ -116,14 +116,12 @@ def _lire_openpyxl(chemin, colonne_id, colonnes, ligne_entete) -> LectureAudit:
     try:
         feuille = choisir_feuille(classeur)
         entetes = entetes_depuis_feuille(feuille, ligne_entete)
-        index_id, index_vf, index_info, avertissements = _resoudre(
-            entetes, colonne_id, colonnes,
-        )
-        utiles = [index_id, index_vf, *(i for i, _ in index_info.values())]
+        index_id, index_info, avertissements = _resoudre(entetes, colonne_id, colonnes)
+        utiles = [index_id, *(i for i, _ in index_info.values())]
         col_min, col_max = min(utiles), max(utiles)
 
         ids: dict[int, str] = {}
-        valeurs: dict[str, dict[int, str]] = {"validation": {}, **{k: {} for k in index_info}}
+        valeurs: dict[str, dict[int, str]] = {k: {} for k in index_info}
         ligne = ligne_entete
         for ligne, rangee in enumerate(
             feuille.iter_rows(
@@ -139,7 +137,6 @@ def _lire_openpyxl(chemin, colonne_id, colonnes, ligne_entete) -> LectureAudit:
             if identifiant is None or not str(identifiant).strip():
                 continue
             ids[ligne] = str(identifiant).strip()
-            valeurs["validation"][ligne] = formater_valeur(lire(index_vf))
             for cle, (index, en_date) in index_info.items():
                 valeurs[cle][ligne] = formater_valeur(lire(index), en_date=en_date)
 
@@ -169,19 +166,23 @@ def _resoudre(entetes: dict[int, str], colonne_id: str, colonnes: ColonnesAudit)
     index_id = trouver(colonne_id)
     if index_id is None:
         raise ColonneAbsente(f"colonne « {colonne_id} » (ID erreur) introuvable")
-    index_vf = trouver(colonnes.validation)
-    if index_vf is None:
-        raise ColonneAbsente(f"colonne « {colonnes.validation} » introuvable")
 
     index_info: dict[str, tuple[int, bool]] = {}
-    avertissements = []
-    for cle, libelle in colonnes.complementaires().items():
+    absentes = []
+    for cle, libelle in colonnes.controlees().items():
         index = trouver(libelle)
         if index is None:
-            avertissements.append(f"colonne « {libelle} » absente — non affichée")
+            absentes.append(f"« {libelle} »")
             continue
-        index_info[cle] = (index, entete_est_date(noms.get(index, libelle)))
-    return index_id, index_vf, index_info, avertissements
+        en_date = cle == "date_audit" or entete_est_date(noms.get(index, libelle))
+        index_info[cle] = (index, en_date)
+    if absentes:
+        pluriel = "s" if len(absentes) > 1 else ""
+        raise ColonneAbsente(
+            f"colonne{pluriel} {', '.join(absentes)} introuvable{pluriel} — "
+            "les quatre colonnes contrôlées sont obligatoires"
+        )
+    return index_id, index_info, []
 
 
 def _assembler(ids: dict[int, str], valeurs: dict[str, dict[int, str]]) -> list[LigneAudit]:

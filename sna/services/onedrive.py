@@ -12,6 +12,7 @@ fichier ouvert (cf. ``services.excel_com``).
 from __future__ import annotations
 
 import os
+import re
 from urllib.parse import quote
 
 _CLE = r"Software\SyncEngines\Providers\OneDrive"
@@ -50,8 +51,20 @@ def montages_onedrive() -> list[tuple[str, str]]:
     return resultat
 
 
+_WEBDAV = re.compile(r"^\\\\(?P<hote>[^\\@]+)@SSL(?:@\d+)?\\DavWWWRoot(?P<chemin>\\.*)?$", re.I)
+
+
 def url_sharepoint(chemin: str, montages: list[tuple[str, str]] | None = None) -> str | None:
-    """Adresse SharePoint d'un fichier situé dans un dossier synchronisé, sinon ``None``."""
+    """Adresse SharePoint d'un fichier situé dans un dossier synchronisé, sinon ``None``.
+
+    Un chemin WebDAV (``\\\\hôte@SSL\\DavWWWRoot\\sites\\…``, accès direct au
+    serveur — ajout de la copie vendorisée, cf. PROVENANCE.md) est converti en
+    son adresse https, pour qu'Excel l'ouvre en co-édition.
+    """
+    webdav = _WEBDAV.match(chemin or "")
+    if webdav:
+        relatif = (webdav.group("chemin") or "").replace("\\", "/")
+        return f"https://{webdav.group('hote').lower()}{quote(relatif, safe='/')}"
     montages = montages_onedrive() if montages is None else montages
     absolu = os.path.abspath(chemin)
     p = os.path.normcase(absolu)

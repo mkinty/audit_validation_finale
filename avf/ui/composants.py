@@ -14,7 +14,7 @@ from sna.ui.theme import Couleurs, Polices
 
 from ..models.colonnes import ColonnesAudit
 
-# Couleurs de statut (renseigné / vide), lisibles sur le fond sombre ; elles
+# Couleurs de statut (validée / non valide), lisibles sur le fond sombre ; elles
 # accompagnent toujours une icône et un libellé, jamais seules.
 VERT_STATUT = "#0ca30c"
 AMBRE_STATUT = "#fab219"
@@ -116,7 +116,7 @@ def champ(parent, variable: tk.StringVar, **options) -> tk.Entry:
 
 
 class BarreSegmentee(tk.Canvas):
-    """Barre fine renseigné / vide (même lecture que dans le rapport HTML)."""
+    """Barre fine validé / non valide (même lecture que dans le rapport HTML)."""
 
     def __init__(self, parent, hauteur: int = 10, **options):
         super().__init__(parent, height=hauteur, highlightthickness=0,
@@ -191,14 +191,14 @@ class DialogueSaisie(_Modal):
 
 
 class DialogueColonnes(_Modal):
-    """Libellés des colonnes lues, colonne des ID erreur et ligne d'en-tête.
+    """Colonnes contrôlées, valeurs acceptées, colonne des ID erreur et ligne d'en-tête.
 
     La colonne des ID erreur et la ligne d'en-tête sont celles des règles de
     mise à jour : un seul réglage pour l'audit et la mise à jour.
     """
 
     def __init__(self, parent, colonnes: ColonnesAudit, colonne_id: str, ligne_entete: int):
-        super().__init__(parent, "Colonnes auditées", 520, 380)
+        super().__init__(parent, "Colonnes auditées", 580, 500)
         tk.Label(
             self, text="Libellés recherchés dans l'onglet « Audit » (casse et espaces ignorés).",
             bg=Couleurs.FOND, fg=Couleurs.TEXTE_SECONDAIRE, font=Polices.LABEL,
@@ -207,27 +207,40 @@ class DialogueColonnes(_Modal):
         grille.pack(fill="x", padx=16)
         self.vars = {
             "colonne_id": tk.StringVar(value=colonne_id),
-            "validation": tk.StringVar(value=colonnes.validation),
             "audit": tk.StringVar(value=colonnes.audit),
             "date_audit": tk.StringVar(value=colonnes.date_audit),
             "auditeur": tk.StringVar(value=colonnes.auditeur),
+            "validation": tk.StringVar(value=colonnes.validation),
+            "valeurs_audit": tk.StringVar(value=", ".join(colonnes.valeurs_audit)),
+            "valeurs_validation": tk.StringVar(value=", ".join(colonnes.valeurs_validation)),
             "ligne_entete": tk.StringVar(value=str(ligne_entete)),
         }
         libelles = [
-            ("colonne_id", "ID erreur *"), ("validation", "Validation finale *"),
-            ("audit", "Audit"), ("date_audit", "Date audit"), ("auditeur", "Auditeur"),
-            ("ligne_entete", "Ligne d'en-tête"),
+            ("colonne_id", "ID erreur"), ("audit", "Audit"), ("date_audit", "Date audit"),
+            ("auditeur", "Auditeur"), ("validation", "Validation finale"), None,
+            ("valeurs_audit", "Audit accepté"), ("valeurs_validation", "Validation finale acceptée"),
+            None, ("ligne_entete", "Ligne d'en-tête"),
         ]
-        for rang, (cle, libelle) in enumerate(libelles):
+        for rang, element in enumerate(libelles):
+            if element is None:
+                tk.Frame(grille, bg=Couleurs.FOND, height=8).grid(row=rang, column=0)
+                continue
+            cle, libelle = element
             tk.Label(grille, text=libelle, bg=Couleurs.FOND, fg=Couleurs.TEXTE,
-                     font=Polices.LABEL, width=18, anchor="w").grid(row=rang, column=0, pady=3)
+                     font=Polices.LABEL, width=24, anchor="w").grid(row=rang, column=0, pady=3)
             champ(grille, self.vars[cle], width=36).grid(row=rang, column=1, sticky="ew", pady=3)
         grille.columnconfigure(1, weight=1)
         tk.Label(
-            self, text="* obligatoires : leur absence fait échouer l'audit de la commune.\n"
-                       "La colonne ID erreur et la ligne d'en-tête servent aussi à la mise à jour.",
+            self,
+            text="Une ligne est validée si : Audit est l'une des valeurs acceptées, Date audit est "
+                 "une date (même saisie en texte : 12/03/2026, 2026-03-12, 12 mars 2026…), Auditeur "
+                 "est renseigné et Validation finale est l'une des valeurs acceptées. Valeurs "
+                 "séparées par des virgules ; casse et espaces ignorés.\n\n"
+                 "Les cinq colonnes sont obligatoires : une colonne absente fait échouer l'audit "
+                 "de la commune. La colonne ID erreur et la ligne d'en-tête servent aussi à la mise à jour.",
             bg=Couleurs.FOND, fg=Couleurs.TEXTE_SECONDAIRE, font=Polices.PETIT, justify="left",
-        ).pack(anchor="w", padx=16, pady=(8, 0))
+            wraplength=540,
+        ).pack(anchor="w", padx=16, pady=(10, 0))
         self._pied(self._valider)
 
     def _valider(self) -> None:

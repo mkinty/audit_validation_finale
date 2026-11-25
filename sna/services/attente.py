@@ -28,6 +28,7 @@ import json
 import os
 
 from ..models.base import ResultatCommune, Statut
+from .identifiants import normaliser_id
 
 
 def charger(fichier: str) -> dict[str, dict]:
@@ -84,10 +85,13 @@ def calculer_echecs_et_reussites(
             for identifiant in ids:
                 echecs[identifiant] = resultat.message or "erreur inconnue"
         else:
+            # ``ids_non_verifies`` porte des ID normalisés (cf. excel_com), les
+            # groupes la saisie brute : « 2a004_1 » doit bien y être reconnu.
+            non_verifies = {normaliser_id(i) for i in resultat.ids_non_verifies}
             for identifiant in ids:
                 if identifiant in resultat.ids_absents:
                     echecs[identifiant] = "ID erreur introuvable dans le fichier"
-                elif identifiant in resultat.ids_non_verifies:
+                elif normaliser_id(identifiant) in non_verifies:
                     echecs[identifiant] = "écriture non confirmée dans SharePoint après enregistrement"
                 else:
                     reussis.append(identifiant)

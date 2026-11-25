@@ -7,14 +7,18 @@ chacun ouvre puis referme sa propre instance (jamais celle de l'utilisateur).
 from __future__ import annotations
 
 from contextlib import contextmanager
+import time
 
 import pytest
 from openpyxl import Workbook, load_workbook
 
 from sna.models.regles import Action, Condition, RegleModification, ReglesConfig, SourceValeur
 from sna.services.colonnes_excel import OngletIntrouvable
-from sna.services.excel import ColonneIntrouvable
-from sna.services.excel_com import SessionExcel, _pid_de, _terminer_si_toujours_ouvert, excel_disponible
+from sna.services.excel import BilanFichier, ColonneIntrouvable
+from sna.services.excel_com import (
+    ExcelBloque, SessionExcel, _FilExcel, _pid_de, _terminer_de_force,
+    _terminer_si_toujours_ouvert, excel_disponible,
+)
 
 pytestmark = pytest.mark.skipif(not excel_disponible(), reason="Excel / pywin32 indisponible")
 
@@ -204,3 +208,61 @@ def test_aucune_regle_active_n_ouvre_pas_le_classeur(tmp_path):
         bilan = session.appliquer_regles(chemin, config, ["13001_1"])
 
     assert bilan.comptes == {} and bilan.ouverture is None
+
+
+# ── Garde-fou anti-blocage (boîte de dialogue de fusion sans réponse) ──
+def test_fil_excel_signale_un_blocage_sans_attendre_la_fonction():
+    fil = _FilExcel(visible=False, delai_occupe_s=30)
+    try:
+        debut = time.monotonic()
+        with pytest.raises(ExcelBloque):
+            fil.executer(lambda: time.sleep(1), delai_s=0.2)
+        assert time.monotonic() - debut < 1    # abandonné bien avant la seconde du faux blocage
+    finally:
+        _terminer_de_force(fil.pid)
+        # Laisse la fonction artificiellement lente se terminer, puis demande au
+        # fil de se nettoyer (CoUninitialize) plutôt que de le laisser bloqué à
+        # jamais sur sa file — un appartement COM qui ne se libère jamais finit
+        # par perturber les tests suivants dans le même processus.
+        time.sleep(1.5)
+        fil.arreter_proprement()
+
+
+def test_blocage_redemarre_excel_et_reessaie(tmp_path):
+    """Un appel qui dépasse le délai ne gèle jamais l'appelant : Excel est tué
+    et remplacé, et la tentative suivante repart sur une instance saine.
+
+    Marge large entre le faux blocage (6 s) et ``delai_blocage_s`` (3 s) :
+    la tentative suivante doit, elle, avoir largement le temps de faire du
+    vrai travail Excel (ouvrir, écrire, enregistrer) sans être elle-même
+    confondue avec un blocage.
+    """
+    chemin = str(tmp_path / "audit.xlsx")
+    _classeur(chemin, ["ID erreur", "Statut"], [["13001_1", "à revoir"]])
+    config = _config(_regle())
+
+    with SessionExcel(delai_blocage_s=3) as session:
+        pid_initial = session._fil.pid
+        original = session._appliquer_une_fois
+        appels = []
+
+        def parfois_bloque(*args, **kwargs):
+            appels.append(1)
+            if len(appels) == 1:
+                time.sleep(6)   # dépasse delai_blocage_s : déclenche ExcelBloque côté appelant
+                # Ne jamais rappeler ``original`` ici : par le temps que ce premier
+                # appel se réveille, l'appelant a déjà abandonné et redémarré Excel
+                # sur un fil différent — toucher du COM ici reviendrait à appeler
+                # l'appartement d'un AUTRE fil depuis celui-ci.
+                return BilanFichier(comptes={})
+            return original(*args, **kwargs)
+
+        session._appliquer_une_fois = parfois_bloque
+        messages = []
+        bilan = session.appliquer_regles(chemin, config, ["13001_1"], on_etape=messages.append)
+
+        assert len(appels) == 2
+        assert bilan.tentatives == 2
+        assert bilan.comptes == {"R1": 1}
+        assert session._fil.pid != pid_initial     # Excel a bien été redémarré
+        assert any("redémarré" in m or "Excel" in m for m in messages)

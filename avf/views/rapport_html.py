@@ -1,15 +1,16 @@
 """Rapport d'audit en HTML autonome (un seul fichier, sans dépendance externe).
 
 Contenu :
-    - en-tête : racine, date, durée, colonnes auditées ;
-    - indicateurs : communes, ID erreur, Validation finale renseignée / vide ;
-    - synthèse par département ;
+    - en-tête : racine, date, durée, colonnes et critères contrôlés ;
+    - indicateurs : communes, ID erreur, lignes validées / non valides ;
+    - motifs de non-validité (critère par critère) et synthèse par département ;
     - tableau des communes (tri, recherche, filtre par état), chaque ligne se
-      dépliant sur ses ID sans Validation finale (avec Audit, Date audit,
-      Auditeur et numéro de ligne) ;
-    - copie en un clic : les ID vides d'une commune, ou de tout le rapport,
-      avec le séparateur choisi (un par ligne par défaut — prêt à coller dans
-      complete_excel_files).
+      dépliant sur ses lignes auditées : ID erreur, ligne, statut, Audit, Date
+      audit, Auditeur, Validation finale et motifs ;
+    - comme dans audit_ppts, le détail ne montre que les lignes non valides ;
+      la case « Afficher aussi les validées » y ajoute les autres ;
+    - copie en un clic des ID erreur non valides, avec le séparateur choisi
+      (un par ligne par défaut — prêt à coller dans complete_excel_files).
 
 Le fichier reste lisible sans JavaScript (tout est rendu côté Python) ; le
 script n'ajoute que tri, filtres, dépliage et copie. Toutes les valeurs issues
@@ -21,29 +22,28 @@ from __future__ import annotations
 from html import escape
 import json
 
-from ..models.audit import AuditCommune, RapportAudit
+from ..models.audit import NON_VALIDES, AuditCommune, LigneAudit, RapportAudit
 from . import presentation as p
 
 
 def generer_html(rapport: RapportAudit) -> str:
     """Document HTML complet du rapport."""
     titre = f"Audit Validation finale — {rapport.date:%d/%m/%Y %H:%M}"
-    donnees = {
-        c.commune: c.ids_vides for c in rapport.communes if c.lisible and c.nb_vides
-    }
+    donnees = rapport.ids_non_valides_par_commune()
+    nb_nv = rapport.nb_ids_non_valides
     return _GABARIT.format(
         titre=escape(titre),
         style=_CSS,
         entete=_entete(rapport),
         indicateurs=_indicateurs(rapport),
-        barre_globale=_barre(rapport.nb_renseignes, rapport.nb_vides, grande=True),
+        barre_globale=_barre(rapport.nb_lignes_valides, rapport.nb_lignes_non_valides, grande=True),
+        motifs=_motifs(rapport),
         departements=_departements(rapport),
         lignes=_lignes_communes(rapport),
-        nb_vides=p.nombre(rapport.nb_vides),
-        desactive_tout="" if rapport.nb_vides else "disabled",
-        tous_ids=escape(p.texte_ids(rapport.tous_ids_vides())) or "Aucun ID sans Validation finale.",
+        nb_non_valides=p.nombre(nb_nv),
+        desactive_tout="" if nb_nv else "disabled",
+        tous_ids=escape(p.texte_ids(rapport.ids_de(NON_VALIDES))) or "Aucun ID erreur non valide.",
         echecs=_echecs(rapport),
-        colonne_vf=escape(rapport.colonnes.validation),
         colonne_id=escape(rapport.colonne_id),
         donnees=_json_script(donnees),
         script=_JS,
@@ -55,13 +55,17 @@ def _entete(r: RapportAudit) -> str:
     c = r.colonnes
     colonnes = ", ".join(
         f"<code>{escape(n)}</code>"
-        for n in (r.colonne_id, c.validation, c.audit, c.date_audit, c.auditeur)
+        for n in (r.colonne_id, c.audit, c.date_audit, c.auditeur, c.validation)
     )
+    criteres = " · ".join(escape(t) for t in p.libelles_criteres(c).values())
     return (
-        f'<p class="meta"><span>📂 <strong>Racine</strong> <code>{escape(r.racine)}</code></span>'
+        f'<p class="meta"><span>{"🌐" if r.source and r.source.sharepoint else "📂"} '
+        f'<strong>Racine</strong> <code>{escape(r.racine)}</code></span>'
+        f"<span>🗂 <strong>Source</strong> {escape(r.libelle_source)}</span>"
         f"<span>🗓 <strong>Généré le</strong> {r.date:%d/%m/%Y à %H:%M}</span>"
         f"<span>⏱ <strong>Durée</strong> {escape(p.duree(r.duree))}</span></p>"
         f'<p class="meta"><span>🔎 <strong>Colonnes lues</strong> (onglet « Audit ») : {colonnes}</span></p>'
+        f'<p class="meta"><span>✅ <strong>Ligne validée si</strong> {criteres}</span></p>'
     )
 
 
@@ -74,41 +78,45 @@ def _tuile(libelle: str, valeur: str, detail: str = "", classe: str = "") -> str
 
 
 def _indicateurs(r: RapportAudit) -> str:
-    taux_vide = r.nb_vides / r.nb_ids if r.nb_ids else None
+    taux_nv = r.nb_lignes_non_valides / r.nb_lignes if r.nb_lignes else None
     return "".join([
         _tuile(
             "Communes auditées", p.nombre(r.nb_communes),
             f"✅ {p.nombre(len(r.communes_completes))} complète(s) · "
-            f"⏳ {p.nombre(len(r.communes_a_traiter))} à compléter · "
+            f"⚠️ {p.nombre(len(r.communes_a_corriger))} à corriger · "
             f"❌ {p.nombre(len(r.en_echec))} en échec",
         ),
-        _tuile("ID erreur", p.nombre(r.nb_ids), f"sur {p.nombre(len(r.lues))} fichier(s) lu(s)"),
         _tuile(
-            "✅ Validation finale renseignée", p.nombre(r.nb_renseignes),
-            f"{p.pourcent(r.taux)} des ID erreur", "tuile-ok",
+            "ID erreur", p.nombre(r.nb_ids),
+            f"⚠️ {p.nombre(r.nb_ids_non_valides)} non valide(s) · "
+            f"✅ {p.nombre(r.nb_ids_valides)} validé(s)",
         ),
         _tuile(
-            "⏳ Validation finale vide", p.nombre(r.nb_vides),
-            f"{p.pourcent(taux_vide)} des ID erreur", "tuile-vide",
+            "✅ Lignes validées", p.nombre(r.nb_lignes_valides),
+            f"{p.pourcent(r.taux)} des {p.nombre(r.nb_lignes)} ligne(s)", "tuile-ok",
+        ),
+        _tuile(
+            "⚠️ Lignes non valides", p.nombre(r.nb_lignes_non_valides),
+            f"{p.pourcent(taux_nv)} des {p.nombre(r.nb_lignes)} ligne(s)", "tuile-vide",
         ),
     ])
 
 
-def _barre(renseignes: int, vides: int, grande: bool = False) -> str:
-    """Barre segmentée fine : part renseignée / part vide (titre = infobulle)."""
-    total = renseignes + vides
+def _barre(valides: int, non_valides: int, grande: bool = False) -> str:
+    """Barre segmentée fine : part validée / part non valide (titre = infobulle)."""
+    total = valides + non_valides
     classe = "barre grande" if grande else "barre"
     if not total:
-        return f'<div class="{classe} barre-neutre" role="img" aria-label="Aucun ID erreur"></div>'
-    pct_ok = renseignes * 100 / total
+        return f'<div class="{classe} barre-neutre" role="img" aria-label="Aucune ligne"></div>'
+    pct_ok = valides * 100 / total
     titre = (
-        f"{p.nombre(renseignes)} renseigné(s) ({p.pourcent(renseignes / total)}) · "
-        f"{p.nombre(vides)} vide(s) ({p.pourcent(vides / total)})"
+        f"{p.nombre(valides)} validée(s) ({p.pourcent(valides / total)}) · "
+        f"{p.nombre(non_valides)} non valide(s) ({p.pourcent(non_valides / total)})"
     )
     segments = []
-    if renseignes:
+    if valides:
         segments.append(f'<span class="seg seg-ok" style="width:{pct_ok:.3f}%"></span>')
-    if vides:
+    if non_valides:
         segments.append(f'<span class="seg seg-vide" style="width:{100 - pct_ok:.3f}%"></span>')
     return (
         f'<div class="{classe}" role="img" aria-label="{titre}" title="{titre}">'
@@ -116,18 +124,35 @@ def _barre(renseignes: int, vides: int, grande: bool = False) -> str:
     )
 
 
+def _motifs(r: RapportAudit) -> str:
+    """Lignes non valides par critère non respecté (une ligne peut en cumuler plusieurs)."""
+    total = r.nb_lignes_non_valides
+    lignes = []
+    for libelle, n in zip(p.libelles_criteres(r.colonnes).values(), r.par_critere().values()):
+        part = n / total if total else 0
+        lignes.append(
+            f"<tr><td>{escape(libelle)}</td><td class=\"num\">{p.nombre(n)}</td>"
+            f'<td class="taux"><div class="barre barre-motif" role="img" '
+            f'aria-label="{p.pourcent(part)} des lignes non valides">'
+            + (f'<span class="seg seg-vide" style="width:{part * 100:.3f}%"></span>' if n else "")
+            + f'</div><span class="pct">{p.pourcent(part) if total else "—"}</span></td></tr>'
+        )
+    return "".join(lignes)
+
+
 def _departements(r: RapportAudit) -> str:
     lignes = []
     for dep, s in r.par_departement().items():
-        taux = s["renseignes"] / s["ids"] if s["ids"] else None
+        taux = s["valides"] / s["lignes"] if s["lignes"] else None
         lignes.append(
             f"<tr><td><strong>Dep{escape(dep)}</strong></td>"
             f'<td class="num">{p.nombre(s["communes"])}</td>'
             f'<td class="num">{p.nombre(s["ids"])}</td>'
-            f'<td class="num">{p.nombre(s["renseignes"])}</td>'
-            f'<td class="num">{p.nombre(s["vides"])}</td>'
+            f'<td class="num">{p.nombre(s["lignes"])}</td>'
+            f'<td class="num">{p.nombre(s["valides"])}</td>'
+            f'<td class="num">{p.nombre(s["non_valides"])}</td>'
             f'<td class="num">{p.nombre(s["erreurs"])}</td>'
-            f'<td class="taux">{_barre(s["renseignes"], s["vides"])}'
+            f'<td class="taux">{_barre(s["valides"], s["non_valides"])}'
             f'<span class="pct">{p.pourcent(taux)}</span></td></tr>'
         )
     return "".join(lignes)
@@ -135,41 +160,43 @@ def _departements(r: RapportAudit) -> str:
 
 def _lignes_communes(r: RapportAudit) -> str:
     if not r.communes:
-        return '<tr><td colspan="8" class="vide-tableau">Aucune commune auditée.</td></tr>'
+        return '<tr><td colspan="9" class="vide-tableau">Aucune commune auditée.</td></tr>'
     return "".join(_ligne_commune(c, r) for c in r.communes)
 
 
 def _ligne_commune(c: AuditCommune, r: RapportAudit) -> str:
     e = p.etat(c)
-    recherche = " ".join([c.commune, f"dep{c.departement}", *c.ids_vides]).lower()
+    recherche = " ".join([c.commune, f"dep{c.departement}", *(i.id_erreur for i in c.ids)]).lower()
     taux_tri = -1 if c.taux is None else c.taux
     alerte = f' <span class="alerte" title="{escape(" · ".join(c.avertissements))}">⚠</span>' if c.avertissements else ""
     copier = (
         f'<button type="button" class="btn btn-petit" data-copier="{escape(c.commune)}" '
-        f'title="Copier les {c.nb_vides} ID sans Validation finale">📋 Copier ({p.nombre(c.nb_vides)})</button>'
-        if c.lisible and c.nb_vides else ""
+        f'title="Copier les {c.nb_ids_non_valides} ID erreur non valides">'
+        f'📋 Copier ({p.nombre(c.nb_ids_non_valides)})</button>'
+        if c.nb_ids_non_valides else ""
     )
-    pliable = bool(c.details_vides or c.avertissements or not c.lisible)
+    pliable = bool(c.ids or c.avertissements or not c.lisible)
     ligne = (
         f'<tr class="commune{" pliable" if pliable else ""}" data-etat="{e.cle}" '
         f'data-recherche="{escape(recherche)}" '
         f'data-k-dep="{escape(c.departement)}" data-k-commune="{escape(c.commune)}" '
-        f'data-k-ids="{c.nb_ids}" data-k-ok="{c.nb_renseignes}" data-k-vides="{c.nb_vides}" '
-        f'data-k-taux="{taux_tri:.6f}" data-k-etat="{e.cle}"'
+        f'data-k-ids="{c.nb_ids}" data-k-lignes="{c.nb_lignes}" data-k-ok="{c.nb_lignes_valides}" '
+        f'data-k-nv="{c.nb_lignes_non_valides}" data-k-taux="{taux_tri:.6f}" data-k-etat="{e.cle}"'
         f'{" tabindex=\"0\" aria-expanded=\"false\"" if pliable else ""}>'
         f'<td><span class="chevron" aria-hidden="true">{"▸" if pliable else ""}</span>Dep{escape(c.departement)}</td>'
         f'<td><strong>{escape(c.commune)}</strong>{alerte}</td>'
         f'<td class="num">{p.nombre(c.nb_ids)}</td>'
-        f'<td class="num">{p.nombre(c.nb_renseignes)}</td>'
-        f'<td class="num">{p.nombre(c.nb_vides)}</td>'
-        f'<td class="taux">{_barre(c.nb_renseignes, c.nb_vides) if c.lisible else ""}'
+        f'<td class="num">{p.nombre(c.nb_lignes)}</td>'
+        f'<td class="num">{p.nombre(c.nb_lignes_valides)}</td>'
+        f'<td class="num">{p.nombre(c.nb_lignes_non_valides)}</td>'
+        f'<td class="taux">{_barre(c.nb_lignes_valides, c.nb_lignes_non_valides) if c.lisible else ""}'
         f'<span class="pct">{p.pourcent(c.taux) if c.lisible else "—"}</span></td>'
         f'<td><span class="etat etat-{e.cle}">{e.icone} {e.libelle}</span></td>'
         f"<td>{copier}</td></tr>"
     )
     if not pliable:
         return ligne
-    return ligne + f'<tr class="detail" hidden><td colspan="8">{_detail(c, r)}</td></tr>'
+    return ligne + f'<tr class="detail" hidden><td colspan="9">{_detail(c, r)}</td></tr>'
 
 
 def _detail(c: AuditCommune, r: RapportAudit) -> str:
@@ -180,34 +207,47 @@ def _detail(c: AuditCommune, r: RapportAudit) -> str:
         morceaux.append(f'<p class="message-erreur">❌ {escape(c.message)}</p>')
     for a in c.avertissements:
         morceaux.append(f'<p class="message-alerte">⚠ {escape(a)}</p>')
-    if c.details_vides:
+    if not c.ids:
+        return "".join(morceaux)
+    if c.ids_non_valides:
         puces = "".join(
-            f'<button type="button" class="puce" data-copier-id="{escape(i.id_erreur)}" '
-            f'title="Copier cet ID">{escape(i.id_erreur)}</button>'
-            for i in c.details_vides
+            f'<button type="button" class="puce" data-copier-id="{escape(i)}" '
+            f'title="Copier cet ID">{escape(i)}</button>'
+            for i in c.ids_non_valides
         )
         morceaux.append(
-            f'<div class="sous-titre">ID erreur sans {escape(r.colonnes.validation)} '
-            f"({p.nombre(c.nb_vides)}) — cliquer sur un ID pour le copier</div>"
+            f'<div class="sous-titre">ID erreur non valides ({p.nombre(c.nb_ids_non_valides)}) '
+            f"— cliquer sur un ID pour le copier</div>"
             f'<div class="puces">{puces}</div>'
         )
-        col = r.colonnes
-        lignes = "".join(
-            f"<tr><td><code>{escape(i.id_erreur)}</code>"
-            f'{" <span class=\"doublon\" title=\"ID présent sur plusieurs lignes\">×" + str(len(i.lignes)) + "</span>" if i.doublon else ""}</td>'
-            f'<td class="num">{", ".join(str(l.ligne) for l in i.lignes if not l.validee)}</td>'
-            f"<td>{escape(i.reference.audit) or _VIDE}</td>"
-            f"<td>{escape(i.reference.date_audit) or _VIDE}</td>"
-            f"<td>{escape(i.reference.auditeur) or _VIDE}</td></tr>"
-            for i in c.details_vides
-        )
-        morceaux.append(
-            '<table class="table-detail"><thead><tr>'
-            f"<th>{escape(r.colonne_id)}</th><th>Ligne(s)</th><th>{escape(col.audit)}</th>"
-            f"<th>{escape(col.date_audit)}</th><th>{escape(col.auditeur)}</th>"
-            f"</tr></thead><tbody>{lignes}</tbody></table>"
-        )
+    col = r.colonnes
+    doublons = {i.id_erreur for i in c.ids if i.doublon}
+    lignes = "".join(_ligne_detail(l, l.id_erreur in doublons) for l in c.lignes)
+    morceaux.append(
+        '<table class="table-detail"><thead><tr>'
+        f"<th>{escape(r.colonne_id)}</th><th class=\"num\">Ligne</th><th>Statut</th>"
+        f"<th>{escape(col.audit)}</th><th>{escape(col.date_audit)}</th><th>{escape(col.auditeur)}</th>"
+        f"<th>{escape(col.validation)}</th><th>Motifs</th>"
+        f"</tr></thead><tbody>{lignes}</tbody></table>"
+        f'<p class="aucune-ligne muet">Aucune ligne non valide — cocher « Afficher aussi les '
+        f'validées » pour voir les {p.nombre(c.nb_lignes)} ligne(s).</p>'
+    )
     return "".join(morceaux)
+
+
+def _ligne_detail(l: LigneAudit, doublon: bool) -> str:
+    e = p.etat_ligne(l)
+    marque = ' <span class="doublon" title="ID présent sur plusieurs lignes">×2+</span>' if doublon else ""
+    return (
+        f'<tr class="l-{e.cle}"><td><code>{escape(l.id_erreur)}</code>{marque}</td>'
+        f'<td class="num">{l.ligne}</td>'
+        f'<td><span class="statut statut-{e.cle}">{e.icone} {e.libelle}</span></td>'
+        f"<td>{escape(l.audit) or _VIDE}</td>"
+        f"<td>{escape(l.date_audit) or _VIDE}</td>"
+        f"<td>{escape(l.auditeur) or _VIDE}</td>"
+        f"<td>{escape(l.validation) or _VIDE}</td>"
+        f'<td class="motifs">{escape(l.motifs) or _VIDE}</td></tr>'
+    )
 
 
 def _echecs(r: RapportAudit) -> str:
@@ -244,10 +284,10 @@ _GABARIT = """<!DOCTYPE html>
 <style>{style}</style>
 </head>
 <body>
-<div class="viz-root">
+<div class="viz-root" id="racine" data-categorie="non_valides">
 <header class="bandeau">
   <div>
-    <h1>Audit de la {colonne_vf}</h1>
+    <h1>Audit des fichiers — Validation finale</h1>
     {entete}
   </div>
   <button type="button" class="btn btn-theme" id="theme" title="Basculer clair / sombre">◐ Thème</button>
@@ -258,20 +298,28 @@ _GABARIT = """<!DOCTYPE html>
 
 <section class="carte">
   <div class="legende">
-    <span><i class="pastille seg-ok"></i>✅ {colonne_vf} renseignée</span>
-    <span><i class="pastille seg-vide"></i>⏳ {colonne_vf} vide</span>
+    <span><i class="pastille seg-ok"></i>✅ Lignes validées</span>
+    <span><i class="pastille seg-vide"></i>⚠️ Lignes non valides</span>
   </div>
   {barre_globale}
 </section>
 
-<section class="carte">
-  <h2>Synthèse par département</h2>
+<section class="carte deux-colonnes">
+  <div>
+    <h2>Motifs de non-validité</h2>
+    <table class="table">
+      <thead><tr><th>Critère non respecté</th><th class="num">Lignes</th><th>Part des non valides</th></tr></thead>
+      <tbody>{motifs}</tbody>
+    </table>
+  </div>
   <div class="defile">
-  <table class="table">
-    <thead><tr><th>Département</th><th class="num">Communes</th><th class="num">ID erreur</th>
-    <th class="num">Renseignés</th><th class="num">Vides</th><th class="num">En échec</th><th>Taux renseigné</th></tr></thead>
-    <tbody>{departements}</tbody>
-  </table>
+    <h2>Synthèse par département</h2>
+    <table class="table">
+      <thead><tr><th>Département</th><th class="num">Communes</th><th class="num">ID erreur</th>
+      <th class="num">Lignes</th><th class="num">Validées</th><th class="num">Non valides</th>
+      <th class="num">En échec</th><th>Taux validé</th></tr></thead>
+      <tbody>{departements}</tbody>
+    </table>
   </div>
 </section>
 
@@ -281,10 +329,12 @@ _GABARIT = """<!DOCTYPE html>
     <input type="search" id="recherche" placeholder="Commune ou ID erreur…" aria-label="Rechercher">
     <div class="filtres" role="group" aria-label="Filtrer par état">
       <button type="button" class="filtre actif" data-filtre="tous">Toutes</button>
-      <button type="button" class="filtre" data-filtre="a-completer">⏳ À compléter</button>
+      <button type="button" class="filtre" data-filtre="a-corriger">⚠️ À corriger</button>
       <button type="button" class="filtre" data-filtre="complete">✅ Complètes</button>
       <button type="button" class="filtre" data-filtre="echec">❌ En échec</button>
     </div>
+    <label class="separateur case" title="Montrer aussi les lignes validées dans le détail des communes">
+      <input type="checkbox" id="aussi-validees"> Afficher aussi les validées</label>
     <label class="separateur">Séparateur
       <select id="separateur">
         <option value="ligne">un par ligne</option>
@@ -293,15 +343,15 @@ _GABARIT = """<!DOCTYPE html>
         <option value="espace">espace</option>
       </select>
     </label>
-    <button type="button" class="btn btn-principal" data-copier-tout="visibles" title="Copie les ID sans Validation finale des communes affichées (filtre et recherche pris en compte)" {desactive_tout}>📋 Copier les ID vides (<span id="nb-visibles">{nb_vides}</span>)</button>
+    <button type="button" class="btn btn-principal" data-copier-tout="visibles" title="Copie les ID erreur non valides des communes affichées (filtre et recherche pris en compte)">📋 Copier les ID non valides affichés (<span id="nb-visibles">{nb_non_valides}</span>)</button>
   </div>
   <div class="defile">
   <table class="table" id="communes">
     <thead><tr>
       <th data-tri="dep">Département</th><th data-tri="commune">Commune</th>
-      <th data-tri="ids" class="num">ID erreur</th><th data-tri="ok" class="num">Renseignés</th>
-      <th data-tri="vides" class="num">Vides</th><th data-tri="taux">Taux renseigné</th>
-      <th data-tri="etat">État</th><th>Copie</th>
+      <th data-tri="ids" class="num">ID erreur</th><th data-tri="lignes" class="num">Lignes</th>
+      <th data-tri="ok" class="num">Validées</th><th data-tri="nv" class="num">Non valides</th>
+      <th data-tri="taux">Taux validé</th><th data-tri="etat">État</th><th>Copie</th>
     </tr></thead>
     <tbody>{lignes}</tbody>
   </table>
@@ -311,7 +361,7 @@ _GABARIT = """<!DOCTYPE html>
 
 <section class="carte">
   <div class="barre-outils">
-    <h2>Tous les ID erreur sans {colonne_vf} ({nb_vides})</h2>
+    <h2>Tous les {colonne_id} non valides ({nb_non_valides})</h2>
     <button type="button" class="btn" data-copier-tout="tous" {desactive_tout}>📋 Copier tout</button>
   </div>
   <pre class="bloc-ids" id="tous-ids">{tous_ids}</pre>
@@ -409,7 +459,18 @@ tr.detail td{background:var(--surface-0);padding:12px 16px 14px 34px}
 .etat{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;white-space:nowrap;
   border:1px solid var(--bordure);color:var(--text-primary)}
 .etat-complete{background:var(--good-fond)}
-.etat-a-completer{background:var(--warning-fond)}
+.etat-a-corriger{background:var(--warning-fond)}
+.statut{display:inline-block;padding:1px 7px;border-radius:999px;font-size:11.5px;white-space:nowrap;
+  border:1px solid var(--bordure);color:var(--text-primary)}
+.statut-validee{background:var(--good-fond)}
+.statut-non-valide{background:var(--warning-fond)}
+.motifs{color:var(--text-secondary);max-width:440px}
+.viz-root[data-categorie="non_valides"] tr.l-validee{display:none}
+.aucune-ligne{display:none;margin:6px 0 0}
+.aucune-ligne.visible{display:block}
+.deux-colonnes{display:grid;grid-template-columns:minmax(320px,1fr) 2fr;gap:28px}
+@media (max-width:1000px){.deux-colonnes{grid-template-columns:1fr}}
+.barre-motif{display:inline-flex;width:140px;vertical-align:middle;margin-right:8px;background:var(--surface-2)}
 .etat-echec{background:var(--critical-fond)}
 .alerte{color:var(--critical);cursor:help}
 .btn{font:inherit;font-size:13px;padding:6px 12px;border-radius:7px;cursor:pointer;
@@ -434,7 +495,7 @@ input[type=search]{min-width:260px}
 .puce{font:12.5px Consolas,ui-monospace,monospace;padding:3px 9px;border-radius:6px;cursor:pointer;
   border:1px solid var(--bordure);background:var(--surface-1);color:var(--text-primary)}
 .puce:hover{border-color:var(--accent)}
-.table-detail{border-collapse:collapse;font-size:12.5px;min-width:520px}
+.table-detail{border-collapse:collapse;font-size:12.5px;min-width:860px}
 .table-detail th,.table-detail td{padding:4px 12px 4px 0;text-align:left;border-bottom:1px solid var(--bordure)}
 .table-detail th{color:var(--text-secondary);font-weight:600}
 .doublon{font-size:11px;color:var(--text-muted)}
@@ -451,7 +512,8 @@ footer{color:var(--text-muted);font-size:12px;padding:8px 32px 28px}
   transition:opacity .2s,transform .2s;pointer-events:none;z-index:10}
 .toast.visible{opacity:1;transform:translateX(-50%) translateY(0)}
 @media print{.btn,.filtres,input,select,.separateur,.btn-theme{display:none!important}
-  tr.detail{display:table-row!important}.viz-root{background:#fff}}
+  tr.detail{display:table-row!important}.viz-root{background:#fff}
+  .viz-root tr.l-validee,.viz-root tr.l-non-valide{display:table-row!important}.table-detail{display:table!important}.aucune-ligne{display:none!important}}
 """
 
 _JS = r"""
@@ -459,6 +521,9 @@ _JS = r"""
   const donnees = JSON.parse(document.getElementById('donnees').textContent || '{}');
   const SEP = {'ligne':'\n','virgule':', ','point-virgule':';','espace':' '};
   const sep = () => SEP[document.getElementById('separateur').value] || '\n';
+  const racineViz = document.getElementById('racine');
+  const caseTous = document.getElementById('aussi-validees');
+  const idsDe = c => donnees[c] || [];
   const toastEl = document.getElementById('toast');
   let minuteur;
   function toast(msg){
@@ -484,7 +549,7 @@ _JS = r"""
   function idsVisibles(){
     const visibles = new Set([...document.querySelectorAll('#communes tr.commune')]
       .filter(tr => !tr.hidden).map(tr => tr.dataset.kCommune));
-    return Object.entries(donnees).filter(([c]) => visibles.has(c)).flatMap(([, ids]) => ids);
+    return Object.keys(donnees).filter(c => visibles.has(c)).flatMap(idsDe);
   }
 
   document.addEventListener('click', ev => {
@@ -492,9 +557,10 @@ _JS = r"""
     if(b){
       ev.stopPropagation();
       if(b.hasAttribute('data-copier-tout'))
-        copier(b.dataset.copierTout === 'visibles' ? idsVisibles() : Object.values(donnees).flat());
+        copier(b.dataset.copierTout === 'visibles' ? idsVisibles()
+          : Object.values(donnees).flat());
       else if(b.dataset.copierId) copier([b.dataset.copierId]);
-      else copier(donnees[b.dataset.copier] || []);
+      else copier(idsDe(b.dataset.copier));
       return;
     }
     const tr = ev.target.closest('tr.commune.pliable');
@@ -531,6 +597,19 @@ _JS = r"""
     if(compteur) compteur.textContent = idsVisibles().length.toLocaleString('fr-FR');
   }
   champ.addEventListener('input', appliquer);
+
+  // « Afficher aussi les validées » (comme dans audit_ppts) : lignes du détail des communes
+  function appliquerCase(){
+    const tous = caseTous.checked;
+    racineViz.dataset.categorie = tous ? 'toutes' : 'non_valides';
+    document.querySelectorAll('.table-detail').forEach(t => {
+      const n = t.querySelectorAll(tous ? 'tbody tr' : 'tr.l-non-valide').length;
+      const msg = t.nextElementSibling;
+      if(msg && msg.classList.contains('aucune-ligne')){ msg.classList.toggle('visible', n === 0); t.hidden = n === 0; }
+    });
+  }
+  caseTous.addEventListener('change', appliquerCase);
+  appliquerCase();
   document.querySelectorAll('.filtre').forEach(b => b.addEventListener('click', () => {
     document.querySelectorAll('.filtre').forEach(x => x.classList.remove('actif'));
     b.classList.add('actif'); filtre = b.dataset.filtre; appliquer();

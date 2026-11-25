@@ -2,12 +2,13 @@
 
 Déroulé, de haut en bas :
 
-    1. dossier racine ;
+    1. dossier racine : dossier local (parcourir), ou lien SharePoint du dossier
+       racine — l'audit lit alors la version serveur des fichiers ;
     2. communes — toutes celles de ``<racine>/Dep<XX>/<commune>`` détectées,
        ou codes INSEE renseignés (le dossier ``Dep<XX>`` en est déduit) ;
-    3. audit (thread de fond, journal en temps réel), rapport en popup,
-       export HTML ;
-    4. mise à jour des ID sans Validation finale — moteur et règles de
+    3. audit des 4 colonnes de chaque ligne (threads de fond, journal en temps réel),
+       rapport en popup, export HTML / Excel / CSV ;
+    4. mise à jour des ID non valides — moteur et règles de
        complete_excel_files, réglables dans le même constructeur de règles.
 
 Toute la logique métier est dans ``avf.services`` (et ``sna.services`` pour la
@@ -36,10 +37,13 @@ from sna.ui.theme import STYLE_STATUT, Couleurs, Polices
 from .. import chemins
 from ..config import Parametres, charger, enregistrer
 from ..models.audit import AuditCommune, RapportAudit
-from ..services import detection
+from ..models.source import EXCEL, LOCAL, SourceAudit
+from ..services import detection, sharepoint
 from ..services.audit import auditer_communes
-from ..services.export import exporter_html, nom_fichier_defaut, ouvrir_dans_navigateur
-from ..services.mise_a_jour import groupes_depuis_rapport, mettre_a_jour, preparer_regles
+from ..services.export import FORMATS, exporter, nom_fichier_defaut, ouvrir_dans_navigateur, ouvrir_fichier
+from ..services.mise_a_jour import (
+    EcritureSharePointImpossible, groupes_depuis_rapport, mettre_a_jour, preparer_regles,
+)
 from ..views import presentation as p
 from .composants import (
     DialogueColonnes, DialogueSaisie, bouton, carte, case, champ, configurer_styles,
@@ -71,6 +75,9 @@ class Application(tk.Tk):
         configurer_styles(self)
 
         self.var_racine = tk.StringVar(value=self.params.racine)
+        self.var_source = tk.StringVar(value=self.params.source)
+        self.var_lien = tk.StringVar(value=self.params.lien_sharepoint)
+        self._source_sp: SourceAudit | None = None   # accès SharePoint établi
         self.var_simulation = tk.BooleanVar(value=False)
         self.var_date_du_jour = tk.BooleanVar(value=self.params.date_du_jour)
         self.var_excel = tk.BooleanVar(value=self.params.ecrire_via_excel and self._excel)
@@ -81,6 +88,8 @@ class Application(tk.Tk):
         self._maj_resume_regles()
         self._maj_etat()
         self.after(PERIODE_FILE, self._vider_file)
+        if self.var_source.get() == "sharepoint" and self.var_lien.get().strip():
+            self.after(300, lambda: self._connecter_sharepoint(silencieux=True))
 
     # ══ Construction ══════════════════════════════════════════════
     def _construire(self) -> None:
@@ -103,10 +112,36 @@ class Application(tk.Tk):
     def _construire_racine(self, parent) -> None:
         c = carte(parent, "1 · Dossier racine")
         c.pack(fill="x")
-        ligne = c.interieur
-        champ(ligne, self.var_racine).pack(side="left", fill="x", expand=True)
-        bouton(ligne, "📁 Parcourir", self._parcourir_racine).pack(side="left", padx=(6, 0))
-        bouton(ligne, "Enregistrer", self._enregistrer_racine, "succes").pack(side="left", padx=(6, 0))
+        choix = tk.Frame(c.interieur, bg=Couleurs.FOND_CARTE)
+        choix.pack(fill="x", pady=(0, 6))
+        self.choix_source = {}
+        for valeur, texte in (("local", "📁 Dossier local (parcourir)"),
+                              ("sharepoint", "🌐 Lien SharePoint (version serveur)")):
+            bouton_radio = tk.Radiobutton(
+                choix, text=texte, value=valeur, variable=self.var_source, command=self._changer_source,
+                bg=Couleurs.FOND_CARTE, fg=Couleurs.TEXTE, selectcolor=Couleurs.FOND_PANNEAU2,
+                activebackground=Couleurs.FOND_CARTE, activeforeground=Couleurs.TEXTE,
+                font=Polices.LABEL, cursor="hand2",
+            )
+            bouton_radio.pack(side="left", padx=(0, 22))
+            self.choix_source[valeur] = bouton_radio
+
+        self.ligne_local = tk.Frame(c.interieur, bg=Couleurs.FOND_CARTE)
+        champ(self.ligne_local, self.var_racine).pack(side="left", fill="x", expand=True)
+        bouton(self.ligne_local, "📁 Parcourir", self._parcourir_racine).pack(side="left", padx=(6, 0))
+        bouton(self.ligne_local, "Enregistrer", self._enregistrer_racine, "succes").pack(side="left", padx=(6, 0))
+
+        self.ligne_sp = tk.Frame(c.interieur, bg=Couleurs.FOND_CARTE)
+        self.champ_lien = champ(self.ligne_sp, self.var_lien)
+        self.champ_lien.pack(side="left", fill="x", expand=True)
+        self.champ_lien.bind("<Return>", lambda e: self._connecter_sharepoint())
+        self.btn_connecter = bouton(self.ligne_sp, "🔗 Se connecter", self._connecter_sharepoint, "succes")
+        self.btn_connecter.pack(side="left", padx=(6, 0))
+
+        self.lbl_source = tk.Label(c.interieur, text="", bg=Couleurs.FOND_CARTE, fg=Couleurs.TEXTE_SECONDAIRE,
+                                   font=Polices.PETIT, anchor="w", justify="left")
+        self.lbl_source.pack(fill="x", pady=(4, 0), side="bottom")
+        self._changer_source(initial=True)
 
     def _construire_communes(self, parent) -> None:
         c = carte(parent, "2 · Communes", "codes INSEE — <racine>/Dep<XX>/<commune>")
@@ -160,15 +195,19 @@ class Application(tk.Tk):
         self.btn_arret.pack(side="left", padx=6)
         self.btn_rapport = bouton(ligne, "📊 Afficher le rapport", self._afficher_rapport, "succes")
         self.btn_rapport.pack(side="left", padx=(18, 0))
-        self.btn_export = bouton(ligne, "💾 Exporter en HTML", self._exporter)
-        self.btn_export.pack(side="left", padx=6)
+        self.btn_export = bouton(ligne, "💾 HTML", lambda: self._exporter("html"))
+        self.btn_export.pack(side="left", padx=(6, 0))
+        self.btn_export_xlsx = bouton(ligne, "📊 Excel", lambda: self._exporter("xlsx"))
+        self.btn_export_xlsx.pack(side="left", padx=(6, 0))
+        self.btn_export_csv = bouton(ligne, "📑 CSV", lambda: self._exporter("csv"))
+        self.btn_export_csv.pack(side="left", padx=6)
         bouton(ligne, "⚙️ Colonnes auditées", self._configurer_colonnes, "discret").pack(side="right")
         self.lbl_bilan = tk.Label(c, text="", bg=Couleurs.FOND_CARTE, fg=Couleurs.TEXTE_SECONDAIRE,
                                   font=Polices.LABEL, justify="left", anchor="w")
         self.lbl_bilan.pack(fill="x", padx=12, pady=(0, 8))
 
     def _construire_mise_a_jour(self, parent) -> None:
-        c = carte(parent, "4 · Mise à jour des ID sans Validation finale",
+        c = carte(parent, "4 · Mise à jour des ID non valides",
                   "même processus que complete_excel_files")
         c.pack(fill="x", pady=(8, 0))
         haut = tk.Frame(c.interieur, bg=Couleurs.FOND_CARTE)
@@ -211,9 +250,106 @@ class Application(tk.Tk):
                                font=Polices.JOURNAL, relief="flat", state="disabled", wrap="word")
         self.txt_log.pack(fill="both", expand=True, pady=(4, 0))
 
-    # ══ Racine ════════════════════════════════════════════════════
+    # ══ Racine : dossier local ou SharePoint ══════════════════════
+    def _source(self) -> SourceAudit | None:
+        """Source courante : dossier local saisi, ou accès SharePoint établi (``None`` sinon)."""
+        if self.var_source.get() == "sharepoint":
+            return self._source_sp
+        racine = self.var_racine.get().strip()
+        return SourceAudit(LOCAL, racine) if racine else None
+
     def _racine(self) -> str:
-        return self.var_racine.get().strip()
+        """Dossier parcouru pour trouver les communes (local, WebDAV ou dossier synchronisé)."""
+        source = self._source()
+        return source.racine if source else ""
+
+    def _racine_ok(self) -> bool:
+        if self.var_source.get() == "sharepoint":
+            return self._source_sp is not None
+        return os.path.isdir(self._racine())
+
+    def _changer_source(self, initial: bool = False) -> None:
+        sharepoint_choisi = self.var_source.get() == "sharepoint"
+        (self.ligne_local if sharepoint_choisi else self.ligne_sp).pack_forget()
+        (self.ligne_sp if sharepoint_choisi else self.ligne_local).pack(fill="x")
+        if not initial:
+            if self.params.source != self.var_source.get():
+                self.params.source = self.var_source.get()
+                self._sauver()
+                self._remplir_communes([])     # les communes listées viennent de l'autre source
+            self._restaurer_selection()
+        self._maj_lbl_source()
+        if not initial:
+            self._maj_etat()
+
+    def _maj_lbl_source(self, texte: str | None = None, couleur: str | None = None) -> None:
+        if texte is None:
+            if self.var_source.get() == "local":
+                texte, couleur = ("Les fichiers sont lus dans ce dossier (copie OneDrive locale le cas échéant).",
+                                  Couleurs.TEXTE_SECONDAIRE)
+            elif self._source_sp is None:
+                texte, couleur = ("Collez le lien SharePoint du dossier racine (barre d'adresse du navigateur), "
+                                  "puis « Se connecter ». L'audit lira la version serveur des fichiers.",
+                                  Couleurs.TEXTE_SECONDAIRE)
+            else:
+                s = self._source_sp
+                texte = f"✅ Connecté — {s.libelle}\n   {s.racine}"
+                if s.mode == EXCEL:
+                    texte += "\n   (WebDAV refusé : chaque fichier est ouvert sur le serveur par Excel — plus lent)"
+                couleur = Couleurs.SUCCES
+        self.lbl_source.config(text=texte, fg=couleur or Couleurs.TEXTE_SECONDAIRE)
+
+    def _connecter_sharepoint(self, silencieux: bool = False) -> None:
+        """Établit l'accès au dossier SharePoint (thread de fond : WebDAV peut être lent à répondre)."""
+        if self.occupe:
+            return
+        lien = self.var_lien.get().strip()
+        try:
+            sharepoint.analyser_lien(lien)
+        except sharepoint.LienInvalide as exc:
+            if not silencieux:
+                messagebox.showwarning("Lien SharePoint", f"Lien inutilisable : {exc}.", parent=self)
+            self._maj_lbl_source(f"❌ Lien inutilisable : {exc}", Couleurs.ERREUR)
+            return
+        if self.params.lien_sharepoint != lien:
+            self.params.lien_sharepoint = lien
+            self._sauver()
+            self._remplir_communes([])
+        self._source_sp = None
+        self._debut_traitement()
+        self._maj_lbl_source("⏳ Connexion au dossier SharePoint…", Couleurs.INFO)
+        self.journaliser(f"🌐 Connexion à SharePoint : {lien}", Couleurs.INFO)
+        threading.Thread(target=self._executer_connexion, args=(lien, silencieux), daemon=True).start()
+
+    def _executer_connexion(self, lien: str, silencieux: bool) -> None:
+        try:
+            source = sharepoint.connecter(lien)
+        except Exception as exc:  # noqa: BLE001 — LienInvalide, AccesImpossible, ou imprévu
+            # Le message est lu ici : « exc » n'existe plus quand le rappel s'exécute.
+            message = str(exc) or exc.__class__.__name__
+            self.planifier(lambda: self._echec_connexion(message, silencieux))
+            return
+        self.planifier(lambda: self._fin_connexion(source))
+
+    def _fin_connexion(self, source: SourceAudit) -> None:
+        self._source_sp = source
+        self._fin_traitement()
+        self.journaliser(f"✅ SharePoint connecté — {source.libelle} : {source.racine}", Couleurs.SUCCES)
+        if source.mode == EXCEL and not self._excel:
+            self.journaliser("⚠️ Excel est nécessaire pour lire les fichiers sur le serveur dans ce mode.",
+                             Couleurs.AVERTISSEMENT)
+        self._maj_lbl_source()
+        self._restaurer_selection()
+        self._maj_etat()
+
+    def _echec_connexion(self, message: str, silencieux: bool) -> None:
+        self._fin_traitement()
+        premiere = message.split("\n")[0]
+        self._maj_lbl_source(f"❌ Non connecté — {premiere}", Couleurs.ERREUR)
+        self.journaliser(f"❌ SharePoint : {premiere}", Couleurs.ERREUR)
+        if not silencieux:
+            messagebox.showerror("Connexion SharePoint", message, parent=self)
+        self._maj_etat()
 
     def _parcourir_racine(self) -> None:
         depart = self._racine() if os.path.isdir(self._racine()) else None
@@ -236,6 +372,12 @@ class Application(tk.Tk):
         self._maj_etat()
 
     def _verifier_racine(self) -> bool:
+        if self.var_source.get() == "sharepoint":
+            if self._source_sp is not None:
+                return True
+            messagebox.showwarning("Dossier SharePoint", "Connectez-vous d'abord au dossier SharePoint "
+                                   "(étape 1 : lien puis « 🔗 Se connecter »).", parent=self)
+            return False
         if os.path.isdir(self._racine()):
             if self.params.racine != self._racine():
                 self.params.racine = self._racine()
@@ -320,7 +462,7 @@ class Application(tk.Tk):
 
     def _restaurer_selection(self) -> None:
         """Recharge les communes sélectionnées au dernier lancement (si elles existent toujours)."""
-        if not os.path.isdir(self._racine()) or not self.params.communes:
+        if not self._racine_ok() or not self.params.communes:
             return
         verif = detection.verifier_communes(self._racine(), self.params.communes)
         self._remplir_communes(verif.trouvees)
@@ -337,26 +479,33 @@ class Application(tk.Tk):
         self._debut_traitement()
         if apres is None:
             self._vider_journal_ui()
+        source = self._source()
         self.journaliser(f"🚀 Audit de {len(communes)} commune(s)", Couleurs.INFO)
+        self.journaliser(f"🗂 Source : {source.libelle} — {source.affichage}", Couleurs.TEXTE_SECONDAIRE)
         self.journaliser(
-            f"🔎 Colonnes : « {self.params.regles.colonne_id} », « {self.params.colonnes.validation} »"
-            f" (+ {', '.join(self.params.colonnes.complementaires().values())})",
-            Couleurs.TEXTE_SECONDAIRE)
+            f"🔎 Ligne validée si : {' · '.join(p.libelles_criteres(self.params.colonnes).values())}"
+            f" (ID dans « {self.params.regles.colonne_id} »)", Couleurs.TEXTE_SECONDAIRE)
         self.journaliser(SEPARATEUR, Couleurs.SEPARATEUR)
-        racine, params = self._racine(), self.params
-        threading.Thread(target=self._executer_audit, args=(communes, racine, params, apres),
+        params = self.params
+        threading.Thread(target=self._executer_audit, args=(communes, source, params, apres),
                          daemon=True).start()
 
-    def _executer_audit(self, communes, racine, params: Parametres, apres) -> None:
+    def _executer_audit(self, communes, source: SourceAudit, params: Parametres, apres) -> None:
         try:
-            rapport = auditer_communes(
-                communes, racine, colonne_id=params.regles.colonne_id, colonnes=params.colonnes,
-                ligne_entete=params.regles.ligne_entete,
-                on_progression=self._progresser,
-                on_resultat=lambda r: self.journaliser(*_ligne_audit(r)),
-                doit_arreter=self._arret.is_set,
-            )
-        except Exception as exc:  # noqa: BLE001 — filet de sécurité, jamais attendu
+            if source.mode == EXCEL and not excel_disponible():
+                raise ExcelIndisponible("Excel est nécessaire pour lire les fichiers sur le serveur "
+                                        "(WebDAV refusé)")
+            with sharepoint.acces_pour(source) as acces:
+                rapport = auditer_communes(
+                    communes, source.racine, colonne_id=params.regles.colonne_id, colonnes=params.colonnes,
+                    ligne_entete=params.regles.ligne_entete,
+                    on_progression=self._progresser,
+                    on_resultat=lambda r: self.journaliser(*_ligne_audit(r)),
+                    doit_arreter=self._arret.is_set,
+                    paralleles=params.paralleles,
+                    source=source, acces=acces,
+                )
+        except Exception as exc:  # noqa: BLE001 — filet de sécurité
             self.journaliser(f"❌ Audit interrompu : {exc}", Couleurs.ERREUR)
             self.planifier(self._fin_traitement)
             return
@@ -400,33 +549,38 @@ class Application(tk.Tk):
             self, self.rapport, on_exporter=self._exporter, on_mettre_a_jour=self._lancer_mise_a_jour,
         )
 
-    def _exporter(self, chemin: str | None = None, ouvrir: bool | None = None) -> str | None:
+    def _exporter(self, format: str = "html", chemin: str | None = None,
+                  ouvrir: bool | None = None) -> str | None:
+        """Exporte le rapport en ``html``, ``xlsx`` ou ``csv`` (``chemin`` : sans boîte de dialogue)."""
         if self.rapport is None:
             return None
         parent = self.fenetre_rapport if (self.fenetre_rapport and self.fenetre_rapport.winfo_exists()) else self
+        libelle, motif = FORMATS.get(format, FORMATS["html"])
         if chemin is None:
             dossier = self.params.dossier_export if os.path.isdir(self.params.dossier_export) else self._racine()
             chemin = filedialog.asksaveasfilename(
-                parent=parent, title="Exporter le rapport HTML", defaultextension=".html",
+                parent=parent, title=f"Exporter le rapport — {libelle}", defaultextension=f".{format}",
                 initialdir=dossier if os.path.isdir(dossier) else None,
-                initialfile=nom_fichier_defaut(self.rapport),
-                filetypes=[("Page HTML", "*.html"), ("Tous les fichiers", "*.*")],
+                initialfile=nom_fichier_defaut(self.rapport, format),
+                filetypes=[(libelle, motif), ("Tous les fichiers", "*.*")],
             )
             if not chemin:
                 return None
         try:
-            chemin = exporter_html(self.rapport, chemin)
+            chemin = exporter(self.rapport, chemin, format)
         except OSError as exc:
-            messagebox.showerror("Export", f"Le rapport n'a pas pu être écrit :\n{exc}", parent=parent)
+            messagebox.showerror("Export", f"Le rapport n'a pas pu être écrit :\n{exc}\n\n"
+                                 "S'il est ouvert dans Excel, fermez-le puis réessayez.", parent=parent)
             return None
         self.params.dossier_export = os.path.dirname(chemin)
         self._sauver()
-        self.journaliser(f"💾 Rapport exporté : {chemin}", Couleurs.INFO)
+        self.journaliser(f"💾 Rapport exporté ({libelle}) : {chemin}", Couleurs.INFO)
+        application = "le navigateur" if format == "html" else "Excel"
         if ouvrir is None:
             ouvrir = messagebox.askyesno("Export", f"Rapport enregistré :\n{chemin}\n\n"
-                                         "L'ouvrir dans le navigateur ?", parent=parent)
+                                         f"L'ouvrir dans {application} ?", parent=parent)
         if ouvrir:
-            ouvrir_dans_navigateur(chemin)
+            (ouvrir_dans_navigateur if format == "html" else ouvrir_fichier)(chemin)
         return chemin
 
     # ══ Colonnes et règles ════════════════════════════════════════
@@ -486,11 +640,17 @@ class Application(tk.Tk):
         if self.occupe:
             return
         parent = self.fenetre_rapport if (self.fenetre_rapport and self.fenetre_rapport.winfo_exists()) else self
-        if self.rapport is None or not self.rapport.nb_vides:
-            messagebox.showinfo("Mise à jour", "Aucun ID sans Validation finale dans le rapport : "
+        if self.rapport is None or not self.rapport.nb_ids_non_valides:
+            messagebox.showinfo("Mise à jour", "Aucun ID erreur non valide dans le rapport : "
                                 "lancez d'abord l'audit.", parent=parent)
             return
         if not self._verifier_racine():
+            return
+        source = self._source()
+        if not _meme_source(self.rapport.source, source):
+            messagebox.showwarning(
+                "Mise à jour", "Le rapport a été produit sur une autre source que celle choisie à "
+                f"l'étape 1 :\n{self.rapport.racine}\n\nRelancez l'audit avant de mettre à jour.", parent=parent)
             return
         groupes = groupes_depuis_rapport(self.rapport, communes)
         if not groupes:
@@ -504,15 +664,22 @@ class Application(tk.Tk):
 
         simulation = self.var_simulation.get()
         via_excel = self.var_excel.get() and self._excel and not simulation
+        if source.sharepoint and not simulation:
+            if not self._excel:
+                messagebox.showerror("Mise à jour", "La mise à jour d'un dossier SharePoint passe par Excel "
+                                     "(co-édition) : Excel / pywin32 sont introuvables sur ce poste.", parent=parent)
+                return
+            via_excel = True   # jamais de réécriture directe d'un fichier sur le serveur
         nb_ids = sum(len(v) for v in groupes.values())
         conflits = [c.commune for c in self.rapport.communes
                     if c.commune in groupes and any("conflit" in a for a in c.avertissements)]
         texte = (
-            f"Mettre à jour {p.nombre(nb_ids)} ID erreur sans Validation finale "
+            f"Mettre à jour {p.nombre(nb_ids)} ID erreur non valide(s) "
             f"sur {len(groupes)} commune(s) ?\n\n"
             + "\n".join(r.resume() for r in regles.actives)
             + "\n\n" + ("🔍 Mode simulation : aucun fichier ne sera modifié." if simulation else
-                        "⚠️ Les fichiers audit d'origine seront modifiés"
+                        ("⚠️ Les fichiers du dossier SharePoint seront modifiés" if source.sharepoint
+                         else "⚠️ Les fichiers audit d'origine seront modifiés")
                         + (" via Excel (co-édition SharePoint)." if via_excel else " (réécriture directe)."))
         )
         if conflits:
@@ -533,19 +700,25 @@ class Application(tk.Tk):
         self.journaliser(SEPARATEUR, Couleurs.SEPARATEUR)
         threading.Thread(
             target=self._executer_mise_a_jour,
-            args=(groupes, regles, self._racine(), simulation, via_excel, self.var_reauditer.get()),
+            args=(groupes, regles, source, simulation, via_excel, self.var_reauditer.get()),
             daemon=True,
         ).start()
 
-    def _executer_mise_a_jour(self, groupes, regles, racine, simulation, via_excel, reauditer) -> None:
+    def _executer_mise_a_jour(self, groupes, regles, source, simulation, via_excel, reauditer) -> None:
         try:
             bilan = mettre_a_jour(
-                groupes, regles, racine, simuler=simulation, via_excel=via_excel,
+                groupes, regles, source.racine, simuler=simulation, via_excel=via_excel, source=source,
                 fichier_attente=self.fichier_attente,
                 on_progression=self._progresser,
                 on_etape=lambda c, m: self.journaliser(f"   · {c} — {m}", Couleurs.TEXTE_SECONDAIRE),
                 on_resultat=lambda r: self.journaliser(*_ligne_maj(r)),
+                paralleles=self.params.paralleles,
+                doit_arreter=self._arret.is_set,
             )
+        except EcritureSharePointImpossible as exc:
+            self.journaliser(f"❌ {exc} — aucune écriture faite.", Couleurs.ERREUR)
+            self.planifier(self._fin_traitement)
+            return
         except ExcelIndisponible as exc:
             self.journaliser(f"❌ {exc} — aucune écriture faite. Décochez « Écrire via Excel » pour "
                              "utiliser la réécriture directe.", Couleurs.ERREUR)
@@ -564,6 +737,10 @@ class Application(tk.Tk):
             f"🎉 {bilan.nb_communes_ok}/{bilan.nb_communes} fichier(s) traité(s) — "
             f"{p.nombre(bilan.nb_modifications)} modification(s){mode} — {p.duree(bilan.duree)}",
             Couleurs.SUCCES)
+        if bilan.interrompu:
+            self.journaliser(f"■ Arrêt demandé : {bilan.nb_communes_demandees - bilan.nb_communes} "
+                             "commune(s) non commencée(s), aucun fichier laissé à moitié écrit",
+                             Couleurs.AVERTISSEMENT)
         if bilan.echecs:
             self.journaliser(f"⏳ {len(bilan.echecs)} ID non appliqué(s) → liste « ID en attente » "
                              f"({bilan.nb_en_attente} au total, {self.fichier_attente})",
@@ -572,6 +749,9 @@ class Application(tk.Tk):
 
         def bilan_final():
             details = f"\n\n⚠️ {len(bilan.echecs)} ID non appliqué(s) — voir le journal." if bilan.echecs else ""
+            if bilan.interrompu:
+                details += (f"\n\n■ Arrêté : {bilan.nb_communes_demandees - bilan.nb_communes} "
+                            "commune(s) non commencée(s).")
             if bilan.simulation:
                 details += "\n\n(simulation : aucun fichier modifié)"
             messagebox.showinfo(
@@ -598,7 +778,10 @@ class Application(tk.Tk):
         self._maj_etat()
 
     def _maj_etat(self) -> None:
-        racine_ok = os.path.isdir(self._racine())
+        racine_ok = self._racine_ok()
+        self.btn_connecter.config(state="normal" if not self.occupe else "disabled")
+        for bouton_radio in self.choix_source.values():
+            bouton_radio.config(state="normal" if not self.occupe else "disabled")
         nb_com, nb_com_sel = len(self.liste_com.codes), len(self.liste_com.curselection())
         self.lbl_com.config(text=f"{nb_com_sel}/{nb_com} sélectionnée(s)")
         libre = not self.occupe
@@ -612,11 +795,12 @@ class Application(tk.Tk):
         self.btn_arret.config(state="normal" if self.occupe else "disabled")
         a_rapport = self.rapport is not None
         self.btn_rapport.config(state=etat(a_rapport))
-        self.btn_export.config(state=etat(a_rapport))
-        self.btn_maj.config(state=etat(a_rapport and bool(self.rapport and self.rapport.nb_vides)))
+        for b in (self.btn_export, self.btn_export_xlsx, self.btn_export_csv):
+            b.config(state=etat(a_rapport))
+        self.btn_maj.config(state=etat(a_rapport and bool(self.rapport and self.rapport.nb_ids_non_valides)))
         if a_rapport:
-            self.btn_maj.config(text=f"🛠️  Mettre à jour les {p.nombre(self.rapport.nb_vides)} ID "
-                                     "sans Validation finale")
+            self.btn_maj.config(text=f"🛠️  Mettre à jour les {p.nombre(self.rapport.nb_ids_non_valides)} "
+                                     "ID non valides")
 
     def _maj_bilan(self) -> None:
         if self.rapport is not None:
@@ -684,16 +868,25 @@ class Application(tk.Tk):
         self.planifier(maj)
 
 
+def _meme_source(du_rapport: SourceAudit | None, courante: SourceAudit | None) -> bool:
+    """Le rapport porte-t-il sur la source choisie (même mode d'accès et même dossier) ?"""
+    if du_rapport is None or courante is None:
+        return True
+    return (du_rapport.sharepoint, os.path.normcase(du_rapport.racine)) == \
+        (courante.sharepoint, os.path.normcase(courante.racine))
+
+
 # ── Lignes de journal ─────────────────────────────────────────────
 def _ligne_audit(c: AuditCommune) -> tuple[str, str]:
     e = p.etat(c)
     if not c.lisible:
         return f"{e.icone} {c.commune} — {c.message}", Couleurs.ERREUR
-    texte = (f"{e.icone} {c.commune} — {p.nombre(c.nb_ids)} ID · {p.nombre(c.nb_renseignes)} renseigné(s) · "
-             f"{p.nombre(c.nb_vides)} vide(s) · {p.duree(c.duree)}")
+    texte = (f"{e.icone} {c.commune} — {p.nombre(c.nb_lignes)} ligne(s) · "
+             f"{p.nombre(c.nb_lignes_valides)} validée(s) · {p.nombre(c.nb_lignes_non_valides)} non valide(s)"
+             f" ({p.nombre(c.nb_ids_non_valides)}/{p.nombre(c.nb_ids)} ID) · {p.duree(c.duree)}")
     for a in c.avertissements:
         texte += f"\n   ⚠ {a}"
-    couleur = Couleurs.AVERTISSEMENT if (c.nb_vides or c.avertissements) else Couleurs.SUCCES
+    couleur = Couleurs.AVERTISSEMENT if (c.nb_lignes_non_valides or c.avertissements) else Couleurs.SUCCES
     return texte, couleur
 
 

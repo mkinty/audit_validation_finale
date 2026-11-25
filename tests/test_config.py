@@ -52,3 +52,22 @@ def test_ancienne_config_avec_departements(tmp_path):
     p = charger(str(fichier))
     assert p.communes == ["13001"]
     assert "departements" not in p.to_dict()
+
+
+def test_paralleles_borne_et_par_defaut(tmp_path):
+    fichier = tmp_path / "cfg.json"
+    for valeur, attendu in ((0, 1), (99, 16), ("x", 4), (3, 3)):
+        fichier.write_text(json.dumps({"paralleles": valeur}), encoding="utf-8")
+        assert charger(str(fichier)).paralleles == attendu
+    assert Parametres().paralleles == 4
+
+
+def test_source_et_lien_sharepoint(tmp_path):
+    fichier = tmp_path / "cfg.json"
+    fichier.write_text(json.dumps({"source": "sharepoint", "lien_sharepoint": " https://x/sites/a/b "}),
+                       encoding="utf-8")
+    p = charger(str(fichier))
+    assert (p.source, p.lien_sharepoint) == ("sharepoint", "https://x/sites/a/b")
+    fichier.write_text(json.dumps({"source": "nimporte"}), encoding="utf-8")
+    assert charger(str(fichier)).source == "local"
+    assert Parametres().source == "local"

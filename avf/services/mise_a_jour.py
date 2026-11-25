@@ -1,4 +1,4 @@
-"""Mise à jour des ID erreur sans « Validation finale » — via le moteur ``sna``.
+"""Mise à jour des ID erreur non valides — via le moteur ``sna``.
 
 Le processus est **celui de l'outil complete_excel_files**, appelé tel quel :
 
@@ -14,7 +14,7 @@ rejoignent la liste « ID en attente » (``sna.services.attente``).
 Ce module ne fait que trois choses en amont :
 
 1. construire ``{commune: [ID erreur]}`` à partir du rapport d'audit — ce sont
-   les ID dont la Validation finale est vide ;
+   les ID non valides (au moins une ligne ne respecte pas les critères d'audit) ;
 2. **dater du jour** les règles qui écrivent la colonne « Date audit »
    (option, activée par défaut) : la règle par défaut de complete_excel_files
    fige la date au jour où la configuration a été créée ; ici elle suit le jour
@@ -38,6 +38,7 @@ from sna.services.excel_com import SessionExcel, excel_disponible
 from sna.services.traitement import traiter_communes
 
 from ..models.audit import RapportAudit
+from ..models.source import EXCEL, SourceAudit
 
 
 @dataclass
@@ -51,6 +52,12 @@ class BilanMiseAJour:
     via_excel: bool = False
     duree: float = 0.0
     nb_en_attente: int = 0
+    nb_communes_demandees: int = 0
+
+    @property
+    def interrompu(self) -> bool:
+        """Arrêt demandé : des communes n'ont pas été commencées (rien n'y a été écrit)."""
+        return self.nb_communes < self.nb_communes_demandees
 
     @property
     def nb_communes(self) -> int:
@@ -73,8 +80,8 @@ class BilanMiseAJour:
 def groupes_depuis_rapport(
     rapport: RapportAudit, communes: Sequence[str] | None = None,
 ) -> dict[str, list[str]]:
-    """``{commune: [ID sans validation finale]}``, éventuellement restreint."""
-    groupes = rapport.ids_vides_par_commune()
+    """``{commune: [ID non valides]}``, éventuellement restreint."""
+    groupes = rapport.ids_non_valides_par_commune()
     if communes is None:
         return groupes
     voulues = set(communes)
@@ -116,6 +123,9 @@ def mettre_a_jour(
     on_etape: Callable[[str, str], None] | None = None,
     on_resultat: Callable[[ResultatCommune], None] | None = None,
     session_factory: Callable[[], object] = SessionExcel,
+    paralleles: int = 1,
+    doit_arreter: Callable[[], bool] | None = None,
+    source: SourceAudit | None = None,
 ) -> BilanMiseAJour:
     """Applique les règles aux ID erreur des communes, comme complete_excel_files.
 
@@ -128,11 +138,30 @@ def mettre_a_jour(
         fichier_attente: liste « ID en attente » à tenir à jour (``None`` :
             non tenue, utile en test).
         session_factory: fabrique de la session Excel (remplaçable en test).
+        paralleles: communes traitées en même temps (threads). Via Excel, la
+            préparation des communes suivantes se fait pendant que la session
+            unique écrit la commune en cours.
+        doit_arreter: consulté avant chaque commune (bouton « Arrêter ») ; une
+            commune commencée va toujours à son terme.
+        source: source de l'audit. En **SharePoint**, l'écriture passe
+            toujours par Excel (co-édition), jamais par une réécriture directe
+            du fichier sur le serveur ; et via une bibliothèque synchronisée,
+            Excel est ouvert même si la copie locale ne contient pas l'ID (elle
+            peut différer du serveur).
 
     Raises:
         sna.services.excel_com.ExcelIndisponible: Excel n'a pas pu démarrer.
+        EcritureSharePointImpossible: source SharePoint sans Excel disponible.
     """
     depart = time.perf_counter()
+    sharepoint = source is not None and source.sharepoint
+    if sharepoint and not simuler:
+        if not _excel_disponible(session_factory):
+            raise EcritureSharePointImpossible(
+                "la mise à jour d'un dossier SharePoint passe par Excel (co-édition), "
+                "et Excel / pywin32 ne sont pas disponibles sur ce poste"
+            )
+        via_excel = True
     ecrire_via_excel = via_excel and not simuler and _excel_disponible(session_factory)
     contexte = session_factory() if ecrire_via_excel else nullcontext()
 
@@ -141,16 +170,23 @@ def mettre_a_jour(
             groupes, regles, racine, simuler=simuler,
             on_progression=on_progression, on_resultat=on_resultat, on_etape=on_etape,
             session_excel=session if ecrire_via_excel else None,
+            paralleles=paralleles, doit_arreter=doit_arreter,
+            prereperage=not (source is not None and source.mode == EXCEL),
         )
 
     echecs, reussis = attente.calculer_echecs_et_reussites(groupes, resultats)
     bilan = BilanMiseAJour(
         resultats=resultats, echecs=echecs, reussis=reussis, simulation=simuler,
         via_excel=ecrire_via_excel, duree=time.perf_counter() - depart,
+        nb_communes_demandees=len(groupes),
     )
     if fichier_attente and not simuler:
         bilan.nb_en_attente = len(attente.mettre_a_jour(fichier_attente, echecs, reussis))
     return bilan
+
+
+class EcritureSharePointImpossible(RuntimeError):
+    """Source SharePoint : la mise à jour exige Excel (co-édition)."""
 
 
 def _excel_disponible(session_factory) -> bool:

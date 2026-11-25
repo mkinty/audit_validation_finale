@@ -57,12 +57,20 @@ def test_lecture_openpyxl_equivalente(racine, forcer_openpyxl):
 
 def test_validation_espaces_seuls_lue_vide(racine):
     lecture = lire_audit(_chemin(racine, "13", "13001"), "ID erreur", ColonnesAudit())
-    assert not lecture.lignes[2].validee  # « 13001_3 » : « ␣␣␣ »
+    assert lecture.lignes[2].validation == ""  # « 13001_3 » : « ␣␣␣ »
 
 
-def test_validation_numerique(racine):
+def test_date_texte_et_casse_lues_telles_quelles(racine):
     lecture = lire_audit(_chemin(racine, "13", "13002"), "ID erreur", ColonnesAudit())
-    assert [l.validation for l in lecture.lignes] == ["OK", "1"]
+    assert [(l.audit, l.date_audit, l.validation) for l in lecture.lignes] == [
+        ("OK", "01/02/2026", "OK"), ("ok", "15/02/2026", "ok"),
+    ]
+
+
+def test_date_numero_de_serie_dans_la_colonne_date(tmp_path):
+    """Une date stockée comme nombre (sans format date) est reconvertie dans « Date audit »."""
+    chemin = ecrire_audit(str(tmp_path / "audit_x.xlsx"), [["13001_1", "a", "OK", 46093, "Moi", "OK"]])
+    assert lire_audit(chemin, "ID erreur", ColonnesAudit()).lignes[0].date_audit == "12/03/2026"
 
 
 @pytest.mark.parametrize("forcer", [False, True])
@@ -89,41 +97,37 @@ def test_colonne_id_absente(racine):
         lire_audit(_chemin(racine, "13", "13001"), "Identifiant", ColonnesAudit())
 
 
-def test_colonne_informative_absente_avertit(tmp_path):
+def test_colonnes_controlees_toutes_obligatoires(tmp_path):
     chemin = ecrire_audit(
         str(tmp_path / "audit_x.xlsx"), [["13001_1", "OK"]],
         entetes=["ID erreur", "Validation finale"],
     )
-    lecture = lire_audit(chemin, "ID erreur", ColonnesAudit())
-    assert len(lecture.avertissements) == 3
-    assert lecture.lignes[0].validation == "OK"
-    assert lecture.lignes[0].audit == ""
+    with pytest.raises(ColonneAbsente, match="« Audit », « Date audit », « Auditeur » introuvables"):
+        lire_audit(chemin, "ID erreur", ColonnesAudit())
 
 
 def test_noms_de_colonnes_personnalises_et_casse(tmp_path):
     chemin = ecrire_audit(
-        str(tmp_path / "audit_x.xlsx"), [["13001_1", "", "Moi"]],
-        entetes=["id ERREUR", "VF", "Contrôleur"],
+        str(tmp_path / "audit_x.xlsx"), [["13001_1", "", "Moi", "OK", "01/01/2026"]],
+        entetes=["id ERREUR", "VF", "Contrôleur", "statut", "le"],
     )
-    colonnes = ColonnesAudit(validation="vf", auditeur="contrôleur")
+    colonnes = ColonnesAudit(validation="vf", auditeur="contrôleur", audit="Statut", date_audit="LE")
     lecture = lire_audit(chemin, "ID erreur", colonnes)
-    assert lecture.lignes[0].auditeur == "Moi"
-    assert not lecture.lignes[0].validee
+    ligne = lecture.lignes[0]
+    assert (ligne.auditeur, ligne.audit, ligne.date_audit, ligne.validation) == ("Moi", "OK", "01/01/2026", "")
 
 
 def test_libelle_court_absent_pas_pris_pour_une_lettre(tmp_path):
     """« VF » absent ne doit pas être lu comme la colonne physique VF."""
-    chemin = ecrire_audit(str(tmp_path / "audit_x.xlsx"), [["13001_1", "OK"]],
-                          entetes=["ID erreur", "Validation finale"])
-    with pytest.raises(ColonneAbsente):
+    chemin = ecrire_audit(str(tmp_path / "audit_x.xlsx"), [["13001_1"] + [None] * 5])
+    with pytest.raises(ColonneAbsente, match="Vf"):
         lire_audit(chemin, "ID erreur", ColonnesAudit(validation="Vf"))
 
 
 def test_lettre_explicite_acceptee(tmp_path):
-    chemin = ecrire_audit(str(tmp_path / "audit_x.xlsx"), [["13001_1", "OK"]],
-                          entetes=["ID erreur", "Validation finale"])
-    lecture = lire_audit(chemin, "A", ColonnesAudit(validation="B"))
-    assert lecture.lignes[0].validation == "OK"
+    chemin = ecrire_audit(str(tmp_path / "audit_x.xlsx"), [["13001_1", "a", "OK", None, "Moi", "OK"]])
+    lecture = lire_audit(chemin, "A", ColonnesAudit(validation="F", audit="C"))
+    assert (lecture.lignes[0].validation, lecture.lignes[0].audit) == ("OK", "OK")
 
 
 def test_ligne_entete_decalee(tmp_path):
@@ -140,7 +144,7 @@ def test_gros_fichier(tmp_path):
     chemin = ecrire_audit(str(tmp_path / "audit_x.xlsx"), lignes)
     lecture = lire_audit(chemin, "ID erreur", ColonnesAudit())
     assert len(lecture.lignes) == 5000
-    assert sum(1 for l in lecture.lignes if not l.validee) == len(range(0, 5000, 3))
+    assert sum(1 for l in lecture.lignes if not l.validation) == len(range(0, 5000, 3))
 
 
 @pytest.mark.parametrize("valeur, en_date, brut, attendu", [
