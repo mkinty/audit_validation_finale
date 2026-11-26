@@ -32,7 +32,7 @@ from . import presentation as p
 def entetes_lignes(rapport: RapportAudit) -> list[str]:
     c = rapport.colonnes
     return [
-        "Département", "Commune", rapport.colonne_id, "Ligne", "Statut",
+        "Département", "Commune", c.id_imm, rapport.colonne_id, "Ligne", "Statut",
         c.audit, c.date_audit, c.auditeur, c.validation, "Motifs", "Fichier",
     ]
 
@@ -43,20 +43,21 @@ def lignes_detail(rapport: RapportAudit, categorie: str = TOUTES) -> list[list]:
     for c in rapport.communes:
         if not c.lisible:
             e = p.etat(c)
-            lignes.append([f"Dep{c.departement}", c.commune, "", None, e.libelle,
+            lignes.append([f"Dep{c.departement}", c.commune, "", "", None, e.libelle,
                            "", "", "", "", c.message, c.chemin])
             continue
         for l in c.lignes_de(categorie):
             lignes.append(_ligne(c, l))
         for i in c.ids_introuvables:          # audit par ID : ID saisi absent du fichier
-            lignes.append([f"Dep{c.departement}", c.commune, i, None, "ID introuvable",
+            id_imm, id_erreur = (i, "") if c.type_ids == "id_imm" else ("", i)
+            lignes.append([f"Dep{c.departement}", c.commune, id_imm, id_erreur, None, "ID introuvable",
                            "", "", "", "", "absent du fichier audit", c.chemin])
     return lignes
 
 
 def _ligne(c: AuditCommune, l: LigneAudit) -> list:
     return [
-        f"Dep{c.departement}", c.commune, l.id_erreur, l.ligne, p.etat_ligne(l).libelle,
+        f"Dep{c.departement}", c.commune, l.id_imm, l.id_erreur, l.ligne, p.etat_ligne(l).libelle,
         l.audit, l.date_audit, l.auditeur, l.validation, l.motifs, c.chemin,
     ]
 
@@ -86,7 +87,7 @@ def generer_xlsx(rapport: RapportAudit) -> Workbook:
     _synthese(wb.active, rapport)
     _communes(wb.create_sheet("Communes"), rapport)
     _lignes(wb.create_sheet("Lignes"), rapport)
-    _ids_non_valides(wb.create_sheet("ID non valides"), rapport)
+    _ids_non_valides(wb.create_sheet("ID imm non valides"), rapport)
     return wb
 
 
@@ -111,7 +112,7 @@ def _synthese(ws, r: RapportAudit) -> None:
         ("Lignes auditées", r.nb_lignes, None),
         ("  validées", r.nb_lignes_valides, _part(r.nb_lignes_valides, r.nb_lignes)),
         ("  non valides", r.nb_lignes_non_valides, _part(r.nb_lignes_non_valides, r.nb_lignes)),
-        ("ID erreur", r.nb_ids, None),
+        (r.colonnes.id_imm, r.nb_ids, None),
         ("  validés", r.nb_ids_valides, _part(r.nb_ids_valides, r.nb_ids)),
         ("  non valides", r.nb_ids_non_valides, _part(r.nb_ids_non_valides, r.nb_ids)),
         None,
@@ -119,7 +120,7 @@ def _synthese(ws, r: RapportAudit) -> None:
         *((libelle, n, _part(n, r.nb_lignes_non_valides))
           for libelle, n in zip(p.libelles_criteres(r.colonnes).values(), r.par_critere().values())),
         None,
-        ("Département", "Communes", "ID erreur", "Lignes", "Validées", "Non valides", "En échec", "Taux validé"),
+        ("Département", "Communes", r.colonnes.id_imm, "Lignes", "Validées", "Non valides", "En échec", "Taux validé"),
         *((f"Dep{dep}", s["communes"], s["ids"], s["lignes"], s["valides"], s["non_valides"],
            s["erreurs"], _part(s["valides"], s["lignes"])) for dep, s in r.par_departement().items()),
     ]
@@ -140,7 +141,7 @@ def _synthese(ws, r: RapportAudit) -> None:
 
 
 def _communes(ws, r: RapportAudit) -> None:
-    entetes = ["Département", "Commune", "État", "ID erreur", "ID non valides", "Lignes", "Validées",
+    entetes = ["Département", "Commune", "État", r.colonnes.id_imm, f"{r.colonnes.id_imm} non valides", "Lignes", "Validées",
                "Non valides", "Taux validé", *p.libelles_criteres(r.colonnes).values(), "Fichier", "Message"]
     ws.append(entetes)
     for c in r.communes:
@@ -160,25 +161,25 @@ def _lignes(ws, r: RapportAudit) -> None:
     ws.append(entetes_lignes(r))
     for valeurs in lignes_detail(r, TOUTES):
         ws.append(valeurs)
-        statut = valeurs[4]
-        ws.cell(ws.max_row, 5).fill = (
+        statut = valeurs[5]
+        ws.cell(ws.max_row, 6).fill = (
             _VERT if statut == p.LIGNE_VALIDEE.libelle
             else _AMBRE if statut == p.LIGNE_NON_VALIDE.libelle else _ROUGE
         )
-    _tableau(ws, [12, 10, 16, 7, 18, 10, 13, 22, 16, 70, 60])
+    _tableau(ws, [12, 10, 18, 16, 7, 18, 10, 13, 22, 16, 70, 60])
 
 
 def _ids_non_valides(ws, r: RapportAudit) -> None:
-    ws.append(["Département", "Commune", r.colonne_id, "Lignes non valides", "Motifs"])
+    ws.append(["Département", "Commune", r.colonnes.id_imm, r.colonne_id, "Lignes non valides", "Motifs"])
     for c in r.communes:
         for i in c.ids:
             if not c.lisible or not i.dans(NON_VALIDES):
                 continue
             fautives = i.lignes_non_valides
             motifs = list(dict.fromkeys(a.message for l in fautives for a in l.anomalies))
-            ws.append([f"Dep{c.departement}", c.commune, i.id_erreur,
+            ws.append([f"Dep{c.departement}", c.commune, i.identifiant, ", ".join(i.ids_erreur),
                        ", ".join(str(l.ligne) for l in fautives), " · ".join(motifs)])
-    _tableau(ws, [12, 10, 16, 18, 90])
+    _tableau(ws, [12, 10, 18, 20, 18, 90])
 
 
 def _tableau(ws, largeurs: list[int]) -> None:

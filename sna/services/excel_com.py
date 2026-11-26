@@ -992,6 +992,7 @@ class SessionExcel:
         _dire(on_etape, "connexion à Excel…")
         classeur, bilan.ouverture = self._ouvrir(fil, chemin_fichier)
         calcul = None
+        externe = False   # classeur déjà ouvert dans l'Excel de l'utilisateur : ne jamais le fermer
         try:
             self._attendre_pret(fil)
             if classeur.ReadOnly:
@@ -999,14 +1000,29 @@ class SessionExcel:
                     qui = classeur.WriteReservedBy
                 except Exception:  # noqa: BLE001
                     qui = ""
-                bilan.verrouille = qui or "un autre utilisateur"
-                _dire(on_etape, f"⚠ classeur verrouillé par {bilan.verrouille} — rien écrit")
-                return bilan
+                # Ajout (cf. PROVENANCE.md) : ouvert en écriture par l'utilisateur lui-même,
+                # dans son propre Excel, notre instance ne l'a qu'en lecture seule ; on écrit
+                # alors dans SON classeur ouvert (cellules seulement), qui reste ouvert.
+                ouvert = _classeur_ouvert_ailleurs([url_sharepoint(chemin_fichier), chemin_fichier], fil.xl)
+                if ouvert is not None:
+                    try:
+                        classeur.Close(False)
+                    except Exception:  # noqa: BLE001
+                        pass
+                    classeur, externe, xl = ouvert, True, ouvert.Application
+                    bilan.ouverture = "classeur déjà ouvert dans votre Excel"
+                    _dire(on_etape, "classeur déjà ouvert dans votre Excel : écriture dans celui-ci "
+                                    "(il reste ouvert ; vos modifications en cours sont enregistrées avec)")
+                else:
+                    bilan.verrouille = qui or "un autre utilisateur"
+                    _dire(on_etape, f"⚠ classeur verrouillé par {bilan.verrouille} — rien écrit")
+                    return bilan
 
-            try:
-                classeur.AutoSaveOn = False   # un enregistrement explicite, pas une fusion continue en arrière-plan
-            except Exception:  # noqa: BLE001 — absent hors SharePoint, sans effet
-                pass
+            if not externe:   # le réglage de l'utilisateur n'est pas touché
+                try:
+                    classeur.AutoSaveOn = False   # un enregistrement explicite, pas une fusion continue
+                except Exception:  # noqa: BLE001 — absent hors SharePoint, sans effet
+                    pass
 
             feuille = _choisir_feuille_com(classeur)
             _dire(on_etape, f"ouverture {bilan.ouverture} — onglet « {feuille.Name} »")
@@ -1075,10 +1091,11 @@ class SessionExcel:
                     xl.Calculation = calcul
                 except Exception:  # noqa: BLE001
                     pass
-            try:
-                classeur.Close(False)
-            except Exception:  # noqa: BLE001
-                pass
+            if not externe:
+                try:
+                    classeur.Close(False)
+                except Exception:  # noqa: BLE001
+                    pass
 
     # ── Vérification après enregistrement ────────────────────────────
     def _verifier(self, fil, classeur, config, entetes, index_id, lignes_avant, ecrits, bilan, on_etape) -> None:
@@ -1205,6 +1222,47 @@ def _correspondance_colonnes(avant: dict[int, str], apres: dict[int, str]) -> di
         if nouveau is not None:
             correspondance[index] = nouveau
     return correspondance
+
+
+def _cle_classeur(nom: str) -> str:
+    """Forme comparable d'un chemin ou d'une adresse de classeur."""
+    from urllib.parse import unquote
+    return unquote(str(nom or "")).replace("\\", "/").strip().rstrip("/").lower()
+
+
+def _classeur_ouvert_ailleurs(cibles, notre_excel=None):
+    """Classeur ``cibles`` (adresse SharePoint ou chemin) ouvert **en écriture** dans
+    une autre instance d'Excel de cette session Windows (celle de l'utilisateur),
+    trouvé dans la table des objets COM en cours ; ``None`` sinon. Ne lève jamais.
+    """
+    cles = {_cle_classeur(c) for c in cibles if c}
+    if not cles:
+        return None
+    try:
+        pythoncom = _pythoncom()
+        import win32com.client as wc
+        rot = pythoncom.GetRunningObjectTable()
+        contexte = pythoncom.CreateBindCtx(0)
+        notre = None
+        try:
+            notre = notre_excel.Hwnd if notre_excel is not None else None
+        except Exception:  # noqa: BLE001
+            pass
+        for moniker in rot:
+            try:
+                if _cle_classeur(moniker.GetDisplayName(contexte, None)) not in cles:
+                    continue
+                classeur = wc.Dispatch(rot.GetObject(moniker).QueryInterface(pythoncom.IID_IDispatch))
+                if _cle_classeur(classeur.FullName) not in cles or classeur.ReadOnly:
+                    continue
+                if notre is not None and classeur.Application.Hwnd == notre:
+                    continue
+                return classeur
+            except Exception:  # noqa: BLE001
+                continue
+    except Exception:  # noqa: BLE001
+        return None
+    return None
 
 
 def _libelle(exc: BaseException) -> str:

@@ -37,9 +37,10 @@ from sna.ui.theme import STYLE_STATUT, Couleurs, Polices
 
 from .. import chemins
 from ..config import Parametres, charger, enregistrer
-from ..models.audit import AuditCommune, RapportAudit
+from ..models.audit import PAR_ID_ERREUR, PAR_ID_IMM, AuditCommune, RapportAudit
 from ..models.source import API, EXCEL, LOCAL, URL, SourceAudit
-from ..services import detection, sharepoint
+from ..services import detection, sharepoint, sharepoint_rest
+from ..services.import_liste import COLONNES_ID, COLONNES_ID_IMM, COLONNES_INSEE
 from sna.services.identifiants import grouper_par_commune
 from ..services.audit import auditer_communes
 from ..services.export import FORMATS, exporter, nom_fichier_defaut, ouvrir_dans_navigateur, ouvrir_fichier
@@ -81,7 +82,8 @@ class Application(tk.Tk):
         self.var_source = tk.StringVar(value=self.params.source)
         self.var_lien = tk.StringVar(value=self.params.lien_sharepoint)
         self._source_sp: SourceAudit | None = None   # accès SharePoint établi
-        self.ids_cibles: dict[str, list[str]] = {}    # audit restreint à ces ID erreur ({} : communes entières)
+        self.ids_cibles: dict[str, list[str]] = {}    # audit restreint à ces ID ({} : communes entières)
+        self.type_cibles = self.params.type_ids       # PAR_ID_ERREUR ou PAR_ID_IMM
         self.var_simulation = tk.BooleanVar(value=False)
         self.var_date_du_jour = tk.BooleanVar(value=self.params.date_du_jour)
         self.var_excel = tk.BooleanVar(value=self.params.ecrire_via_excel and self._excel)
@@ -164,6 +166,8 @@ class Application(tk.Tk):
         self.btn_saisie_com.pack(side="left", padx=6)
         self.btn_saisie_ids = bouton(boutons, "🎯 ID erreur…", self._renseigner_ids)
         self.btn_saisie_ids.pack(side="left")
+        self.btn_saisie_imm = bouton(boutons, "🆔 ID imm…", lambda: self._renseigner_ids(PAR_ID_IMM))
+        self.btn_saisie_imm.pack(side="left", padx=6)
         self.cadre_perimetre = tk.Frame(c.interieur, bg=Couleurs.FOND_CARTE)
         self.lbl_perimetre = tk.Label(self.cadre_perimetre, text="", bg=Couleurs.FOND_CARTE, fg=Couleurs.INFO,
                                       font=Polices.PETIT, anchor="w", justify="left", wraplength=820)
@@ -173,6 +177,11 @@ class Application(tk.Tk):
         self.liste_com = self._liste(c.interieur, colonnes=4)
         self.liste_com.bind("<<ListboxSelect>>", lambda e: (self._sauver_selection(), self._maj_etat()))
         self.lbl_com = self._ligne_selection(c.interieur, self.liste_com)
+        ligne = self.lbl_com.master
+        self.btn_vider_ids = bouton(ligne, "🗑 ID erreur", self._vider_ids, "discret", padx=8, pady=2)
+        self.btn_vider_ids.pack(side="right", padx=(0, 12))
+        self.btn_vider_com = bouton(ligne, "🗑 Communes", self._vider_communes, "discret", padx=8, pady=2)
+        self.btn_vider_com.pack(side="right", padx=4)
 
     def _liste(self, parent, colonnes: int = 1) -> tk.Listbox:
         cadre = tk.Frame(parent, bg=Couleurs.FOND_CARTE)
@@ -432,16 +441,47 @@ class Application(tk.Tk):
         self.journaliser("🚪 Connexion SharePoint oubliée", Couleurs.INFO)
 
     def _existe(self, dossier: str) -> bool:
-        """Un dossier de commune existe-t-il ? Par l'API en connexion navigateur ; sans
-        parcours possible (mode URL), on ne peut pas le vérifier : la commune est retenue,
-        son fichier sera cherché à son adresse."""
-        source = self._source()
+        return self._existe_pour(self._source())(dossier)
+
+    @staticmethod
+    def _existe_pour(source: SourceAudit | None) -> Callable[[str], bool]:
+        """Test d'existence d'un dossier de commune, **utilisable hors du fil de l'interface**.
+
+        Connexion navigateur : par l'arborescence SharePoint gardée en mémoire (un scan
+        rapide, puis aucune requête quel que soit le nombre de communes). Sans parcours
+        possible (mode URL) : la commune est retenue, son fichier sera cherché à son adresse.
+        """
         if source is not None and source.mode == API:
+            acces = sharepoint.AccesApi(source)
+            return lambda dossier: acces.existe(os.path.basename(dossier.rstrip("\\/")))
+        if source is not None and not source.listable:
+            return lambda dossier: True
+        return os.path.isdir
+
+    def _en_fond(self, libelle: str, travail: Callable[[], object], fin: Callable[[object], None]) -> bool:
+        """Exécute ``travail()`` dans un thread, puis ``fin(résultat)`` sur le fil de l'interface.
+
+        Toute opération qui peut attendre le réseau (SharePoint, WebDAV, disque
+        partagé) passe par ici : l'interface ne se fige jamais (« Ne répond pas »).
+        """
+        if self.occupe:
+            return False
+        self._debut_traitement()
+        if libelle:
+            self.journaliser(libelle, Couleurs.INFO)
+
+        def tache() -> None:
             try:
-                return sharepoint.AccesApi(source).existe(os.path.basename(dossier.rstrip("\\/")))
-            except OSError:
-                return False
-        return True if source is not None and not source.listable else os.path.isdir(dossier)
+                resultat = travail()
+            except Exception as exc:  # noqa: BLE001 — remonté au journal, jamais un plantage
+                message = str(exc) or exc.__class__.__name__
+                self.planifier(lambda: (self._fin_traitement(),
+                                        self.journaliser(f"❌ {message}", Couleurs.ERREUR)))
+                return
+            self.planifier(lambda: (self._fin_traitement(), fin(resultat)))
+
+        threading.Thread(target=tache, daemon=True).start()
+        return True
 
     def _detecter_communes(self) -> None:
         if not self._verifier_racine():
@@ -505,58 +545,104 @@ class Application(tk.Tk):
             return
         texte = DialogueSaisie(
             self, "Renseigner des communes",
-            "Saisissez un ou plusieurs codes INSEE (séparés par des virgules, espaces ou retours à "
-            "la ligne). Le dossier Dep<XX> est déduit des deux premiers caractères du code.",
+            "Saisissez ou collez des codes INSEE (séparés par des virgules, espaces ou retours à "
+            "la ligne), ou chargez un fichier (colonne « INSEE »). Le dossier Dep<XX> est déduit "
+            "des deux premiers caractères du code.",
             "13001, 13055  2A004",
-            texte=" ".join(self._codes(self.liste_com, selection=True)),
+            texte="\n".join(self._codes(self.liste_com, selection=True)),
+            colonnes_fichier=COLONNES_INSEE,
         ).montrer()
         if texte is None:
+            return
+        codes = list(dict.fromkeys(detection.parser_communes(texte)))
+        if not codes:
+            messagebox.showinfo("Communes", "Aucun code INSEE dans la saisie.", parent=self)
             return
         self._effacer_ids(silencieux=True)
-        verif = detection.verifier_communes(self._racine(), detection.parser_communes(texte), self._existe)
-        if verif.absentes:
-            messagebox.showwarning(
-                "Communes introuvables",
-                "Ces communes n'ont pas de dossier <racine>/Dep<XX>/<commune> et sont ignorées :\n"
-                + ", ".join(verif.absentes), parent=self)
-        self._remplir_communes(verif.trouvees, selection=[c.code for c in verif.trouvees])
-        if verif.trouvees:
-            self.journaliser(f"✏️ {len(verif.trouvees)} commune(s) renseignée(s)", Couleurs.INFO)
+        racine, existe = self._racine(), self._existe_pour(self._source())
+
+        def fin(verif) -> None:
+            if verif.absentes:
+                messagebox.showwarning(
+                    "Communes introuvables",
+                    f"{len(verif.absentes)} commune(s) sans dossier <racine>/Dep<XX>/<commune> — ignorée(s) :\n"
+                    + _apercu(verif.absentes), parent=self)
+            self._remplir_communes(verif.trouvees, selection=[c.code for c in verif.trouvees])
+            self.journaliser(f"✏️ {len(verif.trouvees)} commune(s) renseignée(s)"
+                             + (f", {len(verif.absentes)} introuvable(s)" if verif.absentes else ""),
+                             Couleurs.INFO)
+
+        self._en_fond(f"🔎 Vérification de {len(codes)} commune(s)…",
+                      lambda: detection.verifier_communes(racine, codes, existe), fin)
 
     # ── Audit restreint à des ID erreur ───────────────────────────
-    def _renseigner_ids(self) -> None:
+    def _renseigner_ids(self, type_ids: str = PAR_ID_ERREUR) -> None:
+        """Audit restreint à des ID saisis : ID erreur (🎯) ou ID imm (🆔)."""
         if not self._verifier_racine():
             return
+        par_imm = type_ids == PAR_ID_IMM
+        nom = self.params.colonnes.id_imm if par_imm else self.params.colonnes.id_erreur
+        precedents = self.params.ids_cibles if self.params.type_ids == type_ids else []
         texte = DialogueSaisie(
-            self, "Auditer seulement des ID erreur",
-            "Collez les ID erreur à auditer (séparés par des virgules, espaces ou retours à la "
-            "ligne). La commune et son dossier Dep<XX> sont déduits du code INSEE en préfixe ; "
-            "seules les lignes de ces ID sont contrôlées.",
-            "13001_2, 13001_15  2A004_1",
-            texte="\n".join(self.params.ids_cibles),
+            self, f"Auditer seulement des {nom}",
+            (f"Collez les {nom} à auditer (séparés par des virgules, espaces ou retours à la ligne), "
+             f"ou chargez un fichier (colonne « {nom} »). "
+             + ("La commune est donnée par les 5 caractères après « ID- » (ID-58006000005V → 58006) ; "
+                if par_imm else "La commune est déduite du code INSEE en préfixe ; ")
+             + "seules les lignes de ces ID sont contrôlées, puis mises à jour."),
+            "ID-58006000005V  ID-2B030000006D" if par_imm else "13001_2, 13001_15  2A004_1",
+            texte="\n".join(precedents),
+            colonnes_fichier=COLONNES_ID_IMM if par_imm else COLONNES_ID,
         ).montrer()
         if texte is None:
             return
-        saisie = detection.verifier_ids(self._racine(), texte, self._existe)
-        problemes = []
-        if saisie.absents:
-            problemes.append("Communes sans dossier <racine>/Dep<XX>/<commune> — ces ID sont ignorés :\n"
-                             + "\n".join(f"  {c} : {', '.join(ids)}" for c, ids in saisie.absents.items()))
-        if saisie.codes_sans_id:
-            problemes.append("Codes INSEE saisis sans numéro d'ID (format <insee>_<numéro>) — ignorés :\n  "
-                             + ", ".join(saisie.codes_sans_id))
-        if problemes:
-            messagebox.showwarning("ID erreur", "\n\n".join(problemes), parent=self)
-        if not saisie.groupes:
-            messagebox.showinfo("ID erreur", "Aucun ID erreur exploitable (format attendu : 13001_2).",
-                                parent=self)
+        racine, existe = self._racine(), self._existe_pour(self._source())
+
+        def fin(saisie) -> None:
+            problemes = []
+            if saisie.absents:
+                ids = [i for v in saisie.absents.values() for i in v]
+                problemes.append(f"{len(saisie.absents)} commune(s) sans dossier <racine>/Dep<XX>/<commune> — "
+                                 f"leurs {len(ids)} {nom} sont ignorés :\n" + _apercu(list(saisie.absents)))
+            if saisie.codes_sans_id:
+                problemes.append("Codes INSEE saisis sans numéro d'ID (format <insee>_<numéro>) — ignorés :\n"
+                                 + _apercu(saisie.codes_sans_id))
+            if problemes:
+                messagebox.showwarning(nom, "\n\n".join(problemes), parent=self)
+            if not saisie.groupes:
+                format_ = "ID-58006000005V" if par_imm else "13001_2"
+                messagebox.showinfo(nom, f"Aucun {nom} exploitable (format attendu : {format_}).", parent=self)
+                return
+            self.ids_cibles = saisie.groupes
+            self.type_cibles = type_ids
+            self.params.ids_cibles = saisie.ids
+            self.params.type_ids = type_ids
+            self._remplir_communes(saisie.trouvees, selection=list(saisie.groupes))
+            self._maj_perimetre()
+            self.journaliser(f"{'🆔' if par_imm else '🎯'} {saisie.nb_ids} {nom} saisi(s) sur "
+                             f"{len(saisie.groupes)} commune(s) — seules leurs lignes seront auditées",
+                             Couleurs.INFO)
+
+        self._en_fond(f"🔎 Vérification des {nom} saisis…",
+                      lambda: detection.verifier_ids(racine, texte, existe, type_ids), fin)
+
+    def _vider_communes(self) -> None:
+        """Vide la liste des communes (codes INSEE) — et les ID saisis qui s'y rapportaient."""
+        if self.occupe or not (self.liste_com.codes or self.ids_cibles):
             return
-        self.ids_cibles = saisie.groupes
-        self.params.ids_cibles = saisie.ids
-        self._remplir_communes(saisie.trouvees, selection=list(saisie.groupes))
-        self._maj_perimetre()
-        self.journaliser(f"🎯 {saisie.nb_ids} ID erreur saisi(s) sur {len(saisie.groupes)} commune(s) — "
-                         "seules leurs lignes seront auditées", Couleurs.INFO)
+        nombre = len(self.liste_com.codes)
+        self._effacer_ids(silencieux=True)
+        self._remplir_communes([])
+        self.journaliser(f"🗑 Liste des communes vidée ({nombre} commune(s))", Couleurs.INFO)
+
+    def _vider_ids(self) -> None:
+        """Oublie les ID erreur saisis et les communes qui en venaient (repartir de zéro)."""
+        if self.occupe or not self.ids_cibles:
+            return
+        nombre = sum(len(v) for v in self.ids_cibles.values())
+        self._effacer_ids(silencieux=True)
+        self._remplir_communes([])
+        self.journaliser(f"🗑 {nombre} {self._nom_ids()} saisi(s) vidé(s), avec leurs communes", Couleurs.INFO)
 
     def _effacer_ids(self, silencieux: bool = False) -> None:
         """Revient à l'audit des communes entières."""
@@ -566,6 +652,7 @@ class Application(tk.Tk):
         self.params.ids_cibles = []
         self._sauver()
         self._maj_perimetre()
+        self._maj_etat()
         if not silencieux:
             self.journaliser("🗂 Audit des communes entières (ID erreur saisis oubliés)", Couleurs.INFO)
 
@@ -576,8 +663,13 @@ class Application(tk.Tk):
         ids = [i for v in self.ids_cibles.values() for i in v]
         apercu = ", ".join(ids[:10]) + (f"… (+{len(ids) - 10})" if len(ids) > 10 else "")
         self.lbl_perimetre.config(
-            text=f"🎯 Audit limité à {len(ids)} ID erreur sur {len(self.ids_cibles)} commune(s) : {apercu}")
+            text=f"{'🆔' if self.type_cibles == PAR_ID_IMM else '🎯'} Audit limité à {len(ids)} "
+                 f"{self._nom_ids()} sur {len(self.ids_cibles)} commune(s) : {apercu}")
         self.cadre_perimetre.pack(fill="x", pady=(6, 0), after=self.btn_det_com.master)
+
+    def _nom_ids(self) -> str:
+        """« ID imm » ou « ID erreur » : nature des ID saisis."""
+        return self.params.colonnes.id_imm if self.type_cibles == PAR_ID_IMM else self.params.colonnes.id_erreur
 
     def _ids_pour(self, communes: list[str]) -> dict[str, list[str]] | None:
         """ID erreur à auditer par commune, ou ``None`` pour les communes entières."""
@@ -599,14 +691,20 @@ class Application(tk.Tk):
     # ── Listes ────────────────────────────────────────────────────
     @staticmethod
     def _remplir(liste: tk.Listbox, elements: list[tuple[str, str]], selection=None) -> None:
+        # Un seul appel Tk pour remplir, et une sélection par plages contiguës :
+        # des milliers de communes (4 000 sur un vrai SharePoint) s'affichent sans attendre.
         liste.delete(0, tk.END)
         liste.codes = [code for code, _ in elements]
-        for _, texte in elements:
-            liste.insert(tk.END, texte)
+        if elements:
+            liste.insert(tk.END, *(texte for _, texte in elements))
         voulus = set(liste.codes if selection is None else selection)
-        for rang, code in enumerate(liste.codes):
-            if code in voulus:
-                liste.selection_set(rang)
+        debut = None
+        for rang, code in enumerate(liste.codes + [None]):
+            if code is not None and code in voulus:
+                debut = rang if debut is None else debut
+            elif debut is not None:
+                liste.selection_set(debut, rang - 1)
+                debut = None
 
     @staticmethod
     def _codes(liste: tk.Listbox, selection: bool = False) -> list[str]:
@@ -622,23 +720,33 @@ class Application(tk.Tk):
         self._maj_etat()
 
     def _restaurer_selection(self) -> None:
-        """Recharge les communes sélectionnées au dernier lancement (si elles existent toujours)."""
+        """Recharge les communes sélectionnées au dernier lancement (si elles existent toujours).
+
+        En arrière-plan : la vérification peut passer par le réseau (SharePoint).
+        """
         if not self._racine_ok():
             return
-        if self.params.ids_cibles:                 # audit restreint à des ID erreur
-            groupes = grouper_par_commune(self.params.ids_cibles)
-            verif = detection.verifier_communes(self._racine(), list(groupes), self._existe)
-            self.ids_cibles = {c.code: groupes[c.code] for c in verif.trouvees}
-            voulues = [c for c in self.params.communes if c in self.ids_cibles] or list(self.ids_cibles)
-            self._remplir_communes(verif.trouvees, selection=voulues)
-            self._maj_perimetre()
-            return
-        if not self.params.communes:
-            return
-        verif = detection.verifier_communes(self._racine(), self.params.communes, self._existe)
-        self._remplir_communes(verif.trouvees)
+        racine, existe = self._racine(), self._existe_pour(self._source())
+        ids_cibles, communes = list(self.params.ids_cibles), list(self.params.communes)
+        if ids_cibles:                             # audit restreint à des ID erreur
+            type_ids = self.params.type_ids
+            groupes = (detection.grouper_ids_imm(ids_cibles) if type_ids == PAR_ID_IMM
+                       else grouper_par_commune(ids_cibles))
 
-    # ══ Audit ═════════════════════════════════════════════════════
+            def fin_ids(verif) -> None:
+                self.ids_cibles = {c.code: groupes[c.code] for c in verif.trouvees}
+                self.type_cibles = type_ids
+                voulues = [c for c in communes if c in self.ids_cibles] or list(self.ids_cibles)
+                self._remplir_communes(verif.trouvees, selection=voulues)
+                self._maj_perimetre()
+
+            self._en_fond("", lambda: detection.verifier_communes(racine, list(groupes), existe), fin_ids)
+            return
+        if not communes:
+            return
+        self._en_fond("", lambda: detection.verifier_communes(racine, communes, existe),
+                      lambda verif: self._remplir_communes(verif.trouvees))
+
     def _lancer_audit(self, communes: list[str] | None = None, apres: Callable | None = None) -> None:
         if self.occupe or not self._verifier_racine():
             return
@@ -654,31 +762,32 @@ class Application(tk.Tk):
         ids = self._ids_pour(communes)
         self.journaliser(f"🚀 Audit de {len(communes)} commune(s)", Couleurs.INFO)
         if ids is not None:
-            self.journaliser(f"🎯 Limité à {sum(len(v) for v in ids.values())} ID erreur saisi(s)",
+            self.journaliser(f"🎯 Limité à {sum(len(v) for v in ids.values())} {self._nom_ids()} saisi(s)",
                              Couleurs.INFO)
         self.journaliser(f"🗂 Source : {source.libelle} — {source.affichage}", Couleurs.TEXTE_SECONDAIRE)
         self.journaliser(
             f"🔎 Ligne validée si : {' · '.join(p.libelles_criteres(self.params.colonnes).values())}"
-            f" (ID dans « {self.params.regles.colonne_id} »)", Couleurs.TEXTE_SECONDAIRE)
+            f" — identifiant des lignes : « {self.params.colonnes.id_imm} »", Couleurs.TEXTE_SECONDAIRE)
         self.journaliser(SEPARATEUR, Couleurs.SEPARATEUR)
         params = self.params
-        threading.Thread(target=self._executer_audit, args=(communes, source, params, apres, ids),
-                         daemon=True).start()
+        threading.Thread(target=self._executer_audit, args=(communes, source, params, apres, ids,
+                                                             self.type_cibles), daemon=True).start()
 
-    def _executer_audit(self, communes, source: SourceAudit, params: Parametres, apres, ids=None) -> None:
+    def _executer_audit(self, communes, source: SourceAudit, params: Parametres, apres, ids=None,
+                        type_ids: str = PAR_ID_ERREUR) -> None:
         try:
             if source.mode in (EXCEL, URL) and not excel_disponible():
                 raise ExcelIndisponible("Excel est nécessaire pour lire les fichiers sur le serveur "
                                         "(WebDAV refusé)")
             with sharepoint.acces_pour(source) as acces:
                 rapport = auditer_communes(
-                    communes, source.racine, colonne_id=params.regles.colonne_id, colonnes=params.colonnes,
+                    communes, source.racine, colonne_id=params.colonnes.id_erreur, colonnes=params.colonnes,
                     ligne_entete=params.regles.ligne_entete,
                     on_progression=self._progresser,
                     on_resultat=lambda r: self.journaliser(*_ligne_audit(r)),
                     doit_arreter=self._arret.is_set,
                     paralleles=params.paralleles,
-                    source=source, acces=acces, ids=ids,
+                    source=source, acces=acces, ids=ids, type_ids=type_ids,
                 )
         except Exception as exc:  # noqa: BLE001 — filet de sécurité
             self.journaliser(f"❌ Audit interrompu : {exc}", Couleurs.ERREUR)
@@ -700,6 +809,7 @@ class Application(tk.Tk):
             self.journaliser("⏹ Audit arrêté à la demande — rapport partiel", Couleurs.AVERTISSEMENT)
         self._fin_traitement()
         self._maj_bilan()
+        self._signaler_telechargement_interdit(c.message for c in rapport.communes)
         if self.fenetre_rapport is not None and self.fenetre_rapport.winfo_exists():
             self.fenetre_rapport.rafraichir(self.rapport)
         if apres is not None:
@@ -760,7 +870,7 @@ class Application(tk.Tk):
 
     # ══ Colonnes et règles ════════════════════════════════════════
     def _configurer_colonnes(self) -> None:
-        resultat = DialogueColonnes(self, self.params.colonnes, self.params.regles.colonne_id,
+        resultat = DialogueColonnes(self, self.params.colonnes, self.params.colonnes.id_imm,
                                     self.params.regles.ligne_entete).montrer()
         if resultat is None:
             return
@@ -850,15 +960,13 @@ class Application(tk.Tk):
         conflits = [c.commune for c in self.rapport.communes
                     if c.commune in groupes and any("conflit" in a for a in c.avertissements)]
         texte = (
-            f"Mettre à jour {p.nombre(nb_ids)} ID erreur non valide(s) "
+            f"Mettre à jour {p.nombre(nb_ids)} ID imm non valide(s) "
             f"sur {len(groupes)} commune(s) ?\n\n"
             + "\n".join(r.resume() for r in regles.actives)
             + "\n\n" + ("🔍 Mode simulation : aucun fichier ne sera modifié." if simulation else
                         ("⚠️ Les fichiers du dossier SharePoint seront modifiés" if source.sharepoint
                          else "⚠️ Les fichiers audit d'origine seront modifiés")
-                        + (" avec votre connexion SharePoint (navigateur) — jamais par-dessus une version "
-                           "enregistrée entre-temps par quelqu'un d'autre." if par_api
-                           else " via Excel (co-édition SharePoint)." if via_excel else " (réécriture directe)."))
+                        + ", ligne par ligne (ID imm) : " + _mode_ecriture(par_api, via_excel, self._excel))
         )
         if conflits:
             texte += ("\n\n⚠ Copie de conflit présente — ces communes seront refusées : "
@@ -868,15 +976,12 @@ class Application(tk.Tk):
 
         self._debut_traitement()
         self._vider_journal_ui()
-        self.journaliser(f"🛠️ Mise à jour de {p.nombre(nb_ids)} ID erreur sur {len(groupes)} commune(s)"
+        self.journaliser(f"🛠️ Mise à jour de {p.nombre(nb_ids)} ID imm sur {len(groupes)} commune(s)"
                          + (" (simulation)" if simulation else ""), Couleurs.INFO)
         for regle in regles.actives:
             self.journaliser(f"   ⚙️ {regle.resume()}", Couleurs.TEXTE_SECONDAIRE)
-        self.journaliser(
-            "🌐 Écriture par l'API SharePoint avec votre connexion (navigateur) — contrôle de version, "
-            "valeurs vérifiées sur le serveur" if par_api
-            else "🔐 Écriture via Excel (co-édition SharePoint) — valeurs vérifiées après enregistrement"
-            if via_excel else "📝 Réécriture directe du fichier (openpyxl)", Couleurs.TEXTE_SECONDAIRE)
+        if not simulation:
+            self.journaliser("✍ " + _mode_ecriture(par_api, via_excel, self._excel), Couleurs.TEXTE_SECONDAIRE)
         self.journaliser(SEPARATEUR, Couleurs.SEPARATEUR)
         threading.Thread(
             target=self._executer_mise_a_jour,
@@ -888,6 +993,7 @@ class Application(tk.Tk):
         try:
             bilan = mettre_a_jour(
                 groupes, regles, source.racine, simuler=simulation, via_excel=via_excel, source=source,
+                colonne_id=self.params.colonnes.id_imm,
                 fichier_attente=self.fichier_attente,
                 on_progression=self._progresser,
                 on_etape=lambda c, m: self.journaliser(f"   · {c} — {m}", Couleurs.TEXTE_SECONDAIRE),
@@ -910,7 +1016,18 @@ class Application(tk.Tk):
             return
         self.planifier(lambda: self._fin_mise_a_jour(bilan, reauditer))
 
+    def _signaler_telechargement_interdit(self, messages) -> bool:
+        """Accès conditionnel de l'organisation : une explication claire, une seule fois."""
+        if not any(TELECHARGEMENT_INTERDIT in (m or "") for m in messages):
+            return False
+        self.journaliser("⛔ Téléchargement des fichiers SharePoint interdit depuis cet appareil "
+                         "(stratégie de l'organisation)", Couleurs.ERREUR)
+        messagebox.showwarning("Accès SharePoint limité par votre organisation",
+                               sharepoint_rest.TelechargementInterdit.EXPLICATION, parent=self)
+        return True
+
     def _fin_mise_a_jour(self, bilan, reauditer: bool) -> None:
+        self._signaler_telechargement_interdit(r.message for r in bilan.resultats)
         mode = " (simulation)" if bilan.simulation else ""
         self.journaliser(SEPARATEUR, Couleurs.SEPARATEUR)
         self.journaliser(
@@ -921,14 +1038,24 @@ class Application(tk.Tk):
             self.journaliser(f"■ Arrêt demandé : {bilan.nb_communes_demandees - bilan.nb_communes} "
                              "commune(s) non commencée(s), aucun fichier laissé à moitié écrit",
                              Couleurs.AVERTISSEMENT)
+        if bilan.sans_excel and not bilan.simulation:
+            self.journaliser(f"ℹ Co-édition Excel non utilisée pour certains fichiers : {bilan.sans_excel}",
+                             Couleurs.AVERTISSEMENT)
         if bilan.echecs:
+            self.journaliser("Pourquoi ces ID imm n'ont pas été mis à jour :", Couleurs.AVERTISSEMENT)
+            for ligne in p.refus_mise_a_jour(bilan.echecs):
+                self.journaliser(ligne, Couleurs.AVERTISSEMENT)
             self.journaliser(f"⏳ {len(bilan.echecs)} ID non appliqué(s) → liste « ID en attente » "
                              f"({bilan.nb_en_attente} au total, {self.fichier_attente})",
                              Couleurs.AVERTISSEMENT)
         self._fin_traitement()
 
         def bilan_final():
-            details = f"\n\n⚠️ {len(bilan.echecs)} ID non appliqué(s) — voir le journal." if bilan.echecs else ""
+            if reauditer and not bilan.simulation and self.rapport is not None:
+                for ligne in p.encore_non_valides(self.rapport, bilan.reussis):
+                    self.journaliser(ligne, Couleurs.AVERTISSEMENT)
+            details = (f"\n\n⚠️ {len(bilan.echecs)} ID non appliqué(s) — raisons dans le journal."
+                       if bilan.echecs else "")
             if bilan.interrompu:
                 details += (f"\n\n■ Arrêté : {bilan.nb_communes_demandees - bilan.nb_communes} "
                             "commune(s) non commencée(s).")
@@ -974,7 +1101,10 @@ class Application(tk.Tk):
         self.btn_det_com.config(state=etat(racine_ok and (source is None or source.listable)))
         self.btn_saisie_com.config(state=etat(racine_ok))
         self.btn_saisie_ids.config(state=etat(racine_ok))
+        self.btn_saisie_imm.config(state=etat(racine_ok))
         self.btn_effacer_ids.config(state=etat(True))
+        self.btn_vider_com.config(state=etat(bool(self.liste_com.codes or self.ids_cibles)))
+        self.btn_vider_ids.config(state=etat(bool(self.ids_cibles)))
         self.btn_audit.config(state=etat(racine_ok and nb_com_sel > 0))
         self.btn_arret.config(state="normal" if self.occupe else "disabled")
         a_rapport = self.rapport is not None
@@ -1060,6 +1190,15 @@ def _meme_source(du_rapport: SourceAudit | None, courante: SourceAudit | None) -
         (courante.sharepoint, os.path.normcase(courante.racine))
 
 
+TELECHARGEMENT_INTERDIT = "téléchargement interdit depuis cet appareil"
+
+
+def _apercu(elements: list[str], nombre: int = 40) -> str:
+    """Liste lisible dans une boîte de dialogue, même pour des centaines d'éléments."""
+    texte = ", ".join(elements[:nombre])
+    return texte + (f"… (+{len(elements) - nombre})" if len(elements) > nombre else "")
+
+
 # ── Lignes de journal ─────────────────────────────────────────────
 def _ligne_audit(c: AuditCommune) -> tuple[str, str]:
     e = p.etat(c)
@@ -1072,6 +1211,21 @@ def _ligne_audit(c: AuditCommune) -> tuple[str, str]:
         texte += f"\n   ⚠ {a}"
     couleur = Couleurs.AVERTISSEMENT if (c.nb_lignes_non_valides or c.avertissements) else Couleurs.SUCCES
     return texte, couleur
+
+
+def _mode_ecriture(par_api: bool, via_excel: bool, excel: bool) -> str:
+    """Comment les cellules seront écrites (confirmation et journal)."""
+    if via_excel:
+        texte = ("cellules écrites via Excel en co-édition, même si le fichier est ouvert par d'autres "
+                 "(valeurs relues après enregistrement)")
+        return texte + (" ; repli : API SharePoint (navigateur)" if par_api else "")
+    if par_api:
+        base = ("API SharePoint avec votre connexion (navigateur), jamais par-dessus une version enregistrée "
+                "entre-temps")
+    else:
+        base = "réécriture directe du fichier (openpyxl)"
+    return base + (" ; un fichier ouvert par quelqu'un est écrit via Excel en co-édition" if excel
+                   else " ; Excel absent : un fichier ouvert par quelqu'un est refusé (raison au journal)")
 
 
 def _ligne_maj(r: ResultatCommune) -> tuple[str, str]:

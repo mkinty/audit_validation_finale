@@ -24,6 +24,10 @@ non valides, avec le **même moteur que complete_excel_files**.
    L'utilisateur ne choisit jamais de département.
    `🎯 ID erreur…` limite l'audit à des **ID erreur** saisis (voir « Audit de
    quelques ID erreur »).
+   `🗑 Communes` vide la liste des communes, et les ID saisis qui s'y rapportaient.
+   `🗑 ID erreur` oublie les ID saisis et leurs communes, pour repartir de zéro.
+   `✖ Communes entières` oublie les ID mais garde leurs communes, pour les auditer en
+   entier.
 3. **Audit** : contrôle de chaque ligne de l'onglet **« Audit »**, journal en temps réel,
    arrêt possible. Le rapport s'ouvre en popup à la fin. `💾 HTML`, `📊 Excel` et `📑 CSV`
    l'exportent, puis proposent de l'ouvrir dans le navigateur ou dans Excel.
@@ -74,6 +78,15 @@ synchronisation et sans Excel, et plusieurs fichiers sont lus à la fois.
 - `🚪 Oublier` efface la session et le profil, pour changer de compte par exemple.
 - **Session expirée pendant un audit** : les communes concernées sont signalées en
   erreur. Il suffit de cliquer de nouveau sur « Se connecter ».
+- **« Téléchargement interdit depuis cet appareil »** : c'est l'**accès conditionnel** de
+  l'organisation (code SharePoint `conditionalAccessPolicyEnforced`). Sur un poste
+  **non géré**, ni joint ni enregistré dans l'annuaire de l'entreprise (`dsregcmd /status`
+  → `AzureAdJoined : NO`, `WorkplaceJoined : NO`), SharePoint laisse lister les dossiers
+  mais refuse le contenu des fichiers. L'outil le signale par un message unique et
+  s'arrête dès le premier refus. Il ne **contourne pas** cette règle de sécurité. Solutions :
+  - utiliser un poste de l'entreprise ;
+  - faire enregistrer ce poste par le service informatique, ou autoriser cet usage ;
+  - auditer une copie locale des fichiers.
 
 **Mise à jour, avec la même connexion** : pas d'Excel ni d'autre identification.
 L'option « Écrire via Excel » ne s'applique pas dans ce mode. Pour chaque commune :
@@ -130,10 +143,58 @@ refusée si le rapport a été produit sur une autre source que celle choisie à
 **Limite** : en mode via Excel, la **simulation** compte les modifications sur la copie
 locale synchronisée, pas sur le serveur.
 
+## Listes longues : saisie, fichier, réactivité
+
+`✏️ Renseigner…` (codes INSEE) et `🎯 ID erreur…` acceptent un texte collé de **n'importe
+quelle longueur**, ou **📄 Charger un fichier…** :
+
+| Fichier | Lecture |
+|---|---|
+| `.txt` | un code par ligne, ou séparés par espaces, virgules ou points-virgules |
+| `.csv` | séparateur détecté (`;`, `,`, tabulation), encodage UTF-8 ou Windows |
+| `.xlsx` / `.xlsm` | toutes les feuilles |
+
+**Colonne cherchée** dans un CSV ou un classeur, par son en-tête : casse, espaces, accents
+et `_` ignorés, dans les 20 premières lignes.
+- Pour les communes : « INSEE », « Code INSEE », « Code commune », « Commune »…
+- Pour les ID : « ID erreur », « ID_erreur », « Identifiant »…
+
+Sans colonne reconnue, tout le fichier est lu : les codes sont extraits par le même motif
+que la saisie. Un code INSEE devenu nombre dans Excel retrouve son zéro de tête
+(`4006` → `04006`). Les valeurs chargées s'affichent dans la zone de saisie, avec leur
+origine, avant validation. Les doublons sont retirés.
+
+**L'interface ne se fige jamais.** Tout ce qui peut attendre le réseau se fait en
+arrière-plan, avec le journal à jour :
+- la connexion ;
+- la détection des communes ;
+- la vérification des communes ou des ID saisis ;
+- le rechargement de la sélection après la connexion ou au lancement.
+
+En connexion navigateur, l'arborescence `Dep*/<commune>` est obtenue par un **scan
+unique** (une requête par `Dep<XX>`, en parallèle) et gardée en mémoire 10 minutes.
+Vérifier ensuite des centaines de codes collés ne coûte aucune requête.
+« 🔍 Détecter » refait toujours le scan.
+
+Mesuré sur un vrai SharePoint de 4 022 communes et 48 départements :
+
+| Action | Durée | Avant |
+|---|---|---|
+| Scan des communes | 6,6 s | — |
+| Vérification de 320 codes collés | 0,1 s | plus de 18 s d'interface figée |
+| Vérification de 640 ID collés | moins de 0,1 s | — |
+
+Le plus long blocage de l'interface mesuré est de 0,13 s.
+
 ## Audit de quelques ID erreur
 
 `🎯 ID erreur…` (étape 2) audite seulement les ID erreur collés, au lieu des communes
-entières. On les colle séparés par des espaces, des virgules ou des retours à la ligne :
+entières. **`🆔 ID imm…`** fait de même avec des ID imm (`ID-58006000005V`) : la commune
+est donnée par les **5 caractères après « ID- »** (`58006`, ou `2B030` pour
+`ID-2B030000006D`). Les minuscules sont acceptées et un en-tête « ID imm » collé avec les
+valeurs est ignoré. Un ID imm absent du fichier de sa commune est signalé, car il peut se
+trouver dans le fichier d'une autre commune. Dans les deux cas, seules les lignes saisies
+sont auditées puis mises à jour, par leur ID imm. On les colle séparés par des espaces, des virgules ou des retours à la ligne :
 `13001_2, 13001_15  2a004_1`.
 
 - La commune, et donc le dossier `<racine>/Dep<XX>/<commune>`, est déduite du code INSEE
@@ -155,6 +216,32 @@ entières. On les colle séparés par des espaces, des virgules ou des retours �
   communes entières.
 
 Cela fonctionne aussi en source SharePoint.
+
+## Identifiant des lignes : l'ID imm
+
+Un **ID erreur** peut couvrir plusieurs logements, donc plusieurs lignes : dans les fichiers
+réels, 102 ID erreur sont répartis sur 304 lignes, et `38071_146` en couvre 5. Seule la
+colonne **« ID imm »** est unique par ligne. L'outil l'utilise donc partout comme
+identifiant :
+
+- les ID **copiés** (boutons `📋`, double-clic, Ctrl+C) sont des ID imm ;
+- la **mise à jour** cible les lignes par leur ID imm : seule la ligne non valide est
+  réécrite, jamais un autre logement du même ID erreur déjà validé ;
+- les comptes « ID » du rapport et la liste « Tous les ID imm non valides » portent sur
+  les ID imm ;
+- dans le détail et les exports, la colonne « ID imm » est placée **avant** « ID erreur ».
+
+La colonne « ID imm » est **obligatoire** : sans elle, la commune passe en « Erreur de
+lecture ». L'audit signale aussi ces cas :
+
+| Cas | Effet |
+|---|---|
+| ID imm en double (erreur de saisie) | avertissement ; la mise à jour modifie chacune de ses lignes |
+| ligne sans ID imm | ligne non valide (critère « ID imm renseigné »), jamais copiée ni mise à jour |
+| ID imm au code d'une autre commune (ex. `ID-3803300000FS` dans le fichier de 38074) | avertissement : à saisir via sa commune réelle |
+
+Les libellés des colonnes « ID imm » et « ID erreur » se règlent dans
+`⚙️ Colonnes auditées`.
 
 ## Règle d'audit
 
@@ -224,7 +311,7 @@ point-virgule, espace) :
 | HTML · bouton `📋 Copier (n)` d'une commune | ses ID non valides |
 | HTML · clic sur un ID | cet ID |
 | HTML · `📋 Copier les ID non valides affichés (n)` | ID non valides des communes **affichées** (filtre et recherche respectés) |
-| HTML · section « Tous les ID erreur non valides » · `📋 Copier tout` | tous les ID non valides du rapport |
+| HTML · section « Tous les ID imm non valides » · `📋 Copier tout` | tous les ID imm non valides du rapport |
 | Popup · `📋 Copier les ID non valides (n)` | ID non valides de la commune sélectionnée |
 | Popup · `📋 Copier les ID non valides affichés (n)` | ID non valides des communes affichées |
 | Popup · double-clic / Ctrl+C dans le détail | ID des lignes sélectionnées (une fois chacun) |
@@ -237,7 +324,7 @@ imprimable (détails dépliés, toutes les lignes).
 
 | Format | Contenu |
 |---|---|
-| `📊 Excel` (.xlsx) | onglets **Synthèse** (indicateurs, critères, motifs, départements), **Communes**, **Lignes** (une par ligne auditée : statut, 4 colonnes, motifs, fichier) et **ID non valides** (un ID par ligne, avec ses lignes fautives et ses motifs). En-têtes figés, filtres automatiques, statuts colorés. |
+| `📊 Excel` (.xlsx) | onglets **Synthèse** (indicateurs, critères, motifs, départements), **Communes**, **Lignes** (une par ligne auditée : ID imm, ID erreur, statut, 4 colonnes, motifs, fichier) et **ID imm non valides** (un ID imm par ligne, avec ses ID erreur, ses lignes fautives et ses motifs). En-têtes figés, filtres automatiques, statuts colorés. |
 | `📑 CSV` | une ligne par ligne auditée (plus une par commune non auditée), mêmes colonnes que l'onglet « Lignes ». Séparateur `;` et UTF-8 avec BOM, comme audit_ppts : il s'ouvre directement dans Excel, accents compris. |
 
 Les valeurs sont exportées telles que lues, sans réinterprétation.
@@ -277,6 +364,49 @@ rechargé pendant la fusion entraîne une nouvelle tentative.
 
 **Doublons.** Toutes les lignes d'un ID en doublon sont mises à jour.
 
+### Fichiers ouverts par d'autres : écriture ligne par ligne
+
+La mise à jour n'écrit que les **cellules des lignes visées, repérées par leur ID imm**. Elle
+ne remplace jamais le fichier entier quand quelqu'un l'a ouvert. La voie choisie dépend du
+fichier :
+
+| Situation | Ce que fait l'outil |
+|---|---|
+| Lien SharePoint, dossier OneDrive choisi par « Parcourir », ou option `🔐 Écrire via Excel` cochée | Excel ouvre chaque fichier par son adresse SharePoint et **rejoint la co-édition** des collègues. Il écrit les cellules, enregistre, puis relit les valeurs. |
+| Fichier déjà ouvert **dans votre propre Excel** | Les cellules sont écrites **dans ce classeur ouvert**, qui est enregistré et reste ouvert (vos modifications en cours sont enregistrées avec). |
+| Option décochée, connexion navigateur (API) | Envoi par l'API SharePoint. Si SharePoint refuse (fichier ouvert, verrou 423), Excel est **démarré à la demande** pour écrire ce fichier en co-édition. |
+| Dossier local, option décochée | Réécriture directe, sauf si le fichier est ouvert : le fichier verrou `~$…` d'Excel donne le nom de la personne, et l'écriture passe alors par Excel. |
+| Excel absent ou inutilisable | Repli expliqué au journal : le fichier ouvert n'est **pas** touché, et ses ID imm partent en « ID en attente ». |
+
+Deux cas ne peuvent pas être forcés. Les débloquer revient à celui qui a le fichier :
+
+- **classeur ouvert en mode exclusif** : un ancien Excel, un fichier sur un partage réseau,
+  ou l'enregistrement automatique désactivé. Excel ne l'obtient qu'en lecture seule. Il doit
+  être fermé, ou ouvert dans Excel Online ou Excel Microsoft 365 avec l'enregistrement
+  automatique ;
+- **fichier extrait (check-out)** dans SharePoint : personne ne peut le modifier avant qu'il
+  soit réarchivé (check-in).
+
+L'API Excel de Microsoft 365, qui écrirait des cellules sans Excel, n'est pas utilisable
+avec la connexion du navigateur : elle exige une application déclarée par l'informatique.
+
+**Pourquoi un ID imm n'est pas mis à jour.** En fin de mise à jour, le journal regroupe les
+ID refusés par raison, avec un conseil pour chacune :
+
+```
+⛔ 12 ID imm non mis à jour — classeur verrouillé par Alice Martin (fichier ouvert) — …
+   ↳ ID-1300100000025, ID-1300100000026, …
+   💡 ID remis en attente : relancez la mise à jour une fois le fichier libéré
+⛔ 1 ID imm non mis à jour — absent de la colonne « ID imm » du fichier
+   ↳ ID-3807400000099
+   💡 vérifiez l'ID imm : faute de frappe, ligne supprimée ou renumérotée, ou ligne rangée
+      dans le fichier d'une autre commune
+```
+
+Après le ré-audit, le journal liste aussi les ID imm écrits **mais encore non valides**,
+avec leurs motifs. Cela arrive quand une condition de règle n'est pas remplie, ou qu'une
+autre colonne reste à corriger.
+
 **Threads pour la rapidité.** L'audit lit plusieurs fichiers à la fois. La mise à
 jour prépare plusieurs communes en parallèle : recherche du fichier, copies de
 conflit et repérage rapide. En écriture openpyxl, elle les écrit aussi en
@@ -289,7 +419,7 @@ défaut ; il se règle par la clé `paralleles` de `config_audit_vf.json` (de 1 
 commune commencée va à son terme, les suivantes ne sont pas touchées et ne
 rejoignent pas « ID en attente ».
 
-Seuls les ID **non valides** du rapport sont transmis (toutes leurs lignes sont réécrites).
+Seuls les ID imm **non valides** du rapport sont transmis : seules leurs lignes sont écrites.
 
 **Valeurs par défaut** — celles de complete_excel_files :
 
@@ -339,7 +469,10 @@ audit_validation_finale/
 │   │                            #   AuditCommune, RapportAudit · SourceAudit (local / SharePoint)
 │   ├── services/                #   logique métier, sans Tkinter
 │   │   ├── detection.py         #     communes : détection sous la racine, saisie, vérification
-│   │   ├── sharepoint.py        #     lien SharePoint → WebDAV ou bibliothèque synchronisée + Excel
+│   │   ├── sharepoint.py        #     connexion (navigateur, repli WebDAV / Excel), accès aux fichiers
+│   │   ├── sharepoint_rest.py   #     API SharePoint : scan, téléchargement, écriture conditionnelle
+│   │   ├── navigateur.py        #     Edge piloté (profil dédié, cookies de session en local)
+│   │   ├── import_liste.py      #     communes / ID depuis un fichier txt, csv, xlsx
 │   │   ├── lecture_audit.py     #     lecture XML en flux des colonnes (repli openpyxl)
 │   │   ├── controle.py          #     4 critères d'une ligne validée, dates en texte
 │   │   ├── audit.py             #     orchestration (threads) → RapportAudit
@@ -363,13 +496,13 @@ audit_validation_finale/
 .venv\Scripts\python -m pytest
 ```
 
-507 tests : détection, lecture (chemin rapide et repli openpyxl comparés),
+561 tests : détection, lecture (chemin rapide et repli openpyxl comparés),
 critères de validité (dates en texte, casse, valeurs acceptées), audit par ligne et par
 ID, rapport HTML (structure, échappement, données de copie par catégorie), exports
-Excel et CSV, audit limité à des ID erreur saisis, connexion SharePoint par le navigateur, audit et mise à jour par l'API (faux serveur SharePoint local : versions, verrous, modification concurrente), source SharePoint (formats de lien, WebDAV, bibliothèque synchronisée,
+Excel et CSV, import de listes (txt, csv, xlsx), réactivité de l'interface avec de longues listes (liste réelle de 320 codes INSEE), identification par ID imm (ID erreur partagé par plusieurs logements, doublons, lignes sans ID imm, migration de configuration), audit limité à des ID erreur ou ID imm saisis, connexion SharePoint par le navigateur, audit et mise à jour par l'API (faux serveur SharePoint local : versions, verrous, modification concurrente), source SharePoint (formats de lien, WebDAV, bibliothèque synchronisée,
 lecture de la version serveur, connexion lente ou refusée, mise à jour forcée via Excel),
 configuration,
-mise à jour de bout en bout (valeurs écrites cellule par cellule, simulation,
+fichiers ouverts (verrou `~$`, co-édition Excel à la demande, refus 423 rattrapé, classeur ouvert dans votre Excel, dossier OneDrive, raisons par ID imm au journal), mise à jour de bout en bout (valeurs écrites cellule par cellule, simulation,
 conflit, règles personnalisées, identité avec le moteur appelé directement),
 écriture via une **vraie instance Excel** (ignorée sans Excel) — garde-fou anti-blocage, redémarrage, relecture par ID, appels concurrents —, traitement et audit en parallèle, arrêt, et interface
 Tkinter pilotée (détection des communes → audit → popup → « Afficher aussi les validées » →

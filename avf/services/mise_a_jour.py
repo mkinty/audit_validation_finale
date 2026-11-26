@@ -39,6 +39,7 @@ from sna.services.traitement import traiter_communes
 
 from ..models.audit import RapportAudit
 from ..models.source import API, EXCEL, URL, SourceAudit
+from .ecriture import SessionEcriture
 
 
 @dataclass
@@ -54,6 +55,7 @@ class BilanMiseAJour:
     nb_en_attente: int = 0
     nb_communes_demandees: int = 0
     via_api: bool = False   # écriture par l'API SharePoint (session du navigateur)
+    sans_excel: str = ""    # pourquoi la co-édition Excel n'a pas été utilisée (repli)
 
     @property
     def interrompu(self) -> bool:
@@ -81,7 +83,8 @@ class BilanMiseAJour:
 def groupes_depuis_rapport(
     rapport: RapportAudit, communes: Sequence[str] | None = None,
 ) -> dict[str, list[str]]:
-    """``{commune: [ID non valides]}``, éventuellement restreint."""
+    """``{commune: [ID imm non valides]}``, éventuellement restreint (à mettre à jour avec
+    ``colonne_id=rapport.colonnes.id_imm``)."""
     groupes = rapport.ids_non_valides_par_commune()
     if communes is None:
         return groupes
@@ -127,6 +130,7 @@ def mettre_a_jour(
     paralleles: int = 1,
     doit_arreter: Callable[[], bool] | None = None,
     source: SourceAudit | None = None,
+    colonne_id: str | None = None,
 ) -> BilanMiseAJour:
     """Applique les règles aux ID erreur des communes, comme complete_excel_files.
 
@@ -144,6 +148,8 @@ def mettre_a_jour(
             unique écrit la commune en cours.
         doit_arreter: consulté avant chaque commune (bouton « Arrêter ») ; une
             commune commencée va toujours à son terme.
+        colonne_id: colonne qui identifie les lignes de ``groupes`` (l'**ID imm** pour un
+            rapport d'audit), à la place de celle des règles.
         source: source de l'audit. En **SharePoint**, l'écriture passe
             toujours par Excel (co-édition), jamais par une réécriture directe
             du fichier sur le serveur ; et via une bibliothèque synchronisée,
@@ -155,27 +161,43 @@ def mettre_a_jour(
         EcritureSharePointImpossible: source SharePoint sans Excel disponible.
     """
     depart = time.perf_counter()
-    # Connexion par le navigateur : la mise à jour utilise la même session, par l'API
-    # SharePoint (téléchargement, moteur openpyxl de complete_excel_files, renvoi
-    # conditionnel à la version lue) — ni Excel, ni autre identification.
-    via_api = source is not None and source.mode == API and not simuler
+    if colonne_id:
+        # Identifiant des lignes à modifier : l'ID imm (unique), pas l'ID erreur (qui peut
+        # couvrir plusieurs logements : toutes ses lignes seraient modifiées ensemble).
+        regles = ReglesConfig.from_dict({**regles.to_dict(), "colonne_id": colonne_id})
+    # Écriture cellule par cellule en co-édition Excel (le fichier peut être ouvert par
+    # d'autres), avec repli expliqué si Excel est indisponible — cf. services.ecriture.
     sharepoint = source is not None and source.sharepoint
-    if sharepoint and not simuler and not via_api:
-        if not _excel_disponible(session_factory):
-            raise EcritureSharePointImpossible(
-                "la mise à jour d'un dossier SharePoint passe par Excel (co-édition), "
-                "et Excel / pywin32 ne sont pas disponibles sur ce poste"
-            )
-        via_excel = True
-    ecrire_via_excel = via_excel and not simuler and not via_api and _excel_disponible(session_factory)
-    if via_api:
-        from .sharepoint import SessionApi, client_pour
-        contexte = SessionApi(client_pour(source.lien))
-    elif session_factory is SessionExcel:
-        # Si Office demande la connexion Microsoft 365, la montrer plutôt qu'échouer.
-        contexte = SessionExcel(connexion_interactive=True) if ecrire_via_excel else nullcontext()
+    par_api = source is not None and source.mode == API
+    excel_ok = _excel_disponible(session_factory)
+    if sharepoint and not simuler and not par_api and not excel_ok:
+        raise EcritureSharePointImpossible(
+            "la mise à jour d'un dossier SharePoint passe par Excel (co-édition), "
+            "et Excel / pywin32 ne sont pas disponibles sur ce poste"
+        )
+    # Dossier « Parcourir » synchronisé par OneDrive : ses fichiers sont ceux de SharePoint.
+    # Une réécriture locale entière y crée des copies en conflit si un collègue a le
+    # fichier ouvert (les verrous ``~$`` des autres ne sont pas synchronisés) : Excel aussi.
+    synchronise = not sharepoint and _synchronise(racine)
+    # SharePoint hors API et OneDrive : Excel est la seule écriture sûre ; ailleurs,
+    # l'option de l'utilisateur — et Excel reste appelé à la demande pour tout fichier ouvert.
+    veut_excel = excel_ok and (via_excel or synchronise or (sharepoint and not par_api))
+    if session_factory is SessionExcel:
+        fabrique_excel = lambda: SessionExcel(connexion_interactive=True)  # noqa: E731
     else:
-        contexte = session_factory() if ecrire_via_excel else nullcontext()
+        fabrique_excel = session_factory
+    if simuler:
+        contexte = nullcontext()
+    else:
+        repli = None
+        if par_api:
+            from .sharepoint import SessionApi, client_pour
+            repli = SessionApi(client_pour(source.lien))
+        raison = "" if veut_excel else (
+            "Excel / pywin32 introuvables sur ce poste" if not excel_ok
+            else "option « Écrire via Excel (co-édition) » décochée")
+        contexte = SessionEcriture(fabrique_excel if excel_ok else None, repli=repli,
+                                   raison_sans_excel=raison, prefere_excel=veut_excel)
 
     # Dossier non parcourable localement : le fichier de chaque commune est désigné
     # par son adresse SharePoint (trouvé par l'API, ou déduit du nommage).
@@ -199,7 +221,7 @@ def mettre_a_jour(
         resultats = traiter_communes(
             groupes, regles, racine, simuler=simuler,
             on_progression=on_progression, on_resultat=on_resultat, on_etape=on_etape,
-            session_excel=session if (ecrire_via_excel or via_api) else None,
+            session_excel=session if not simuler else None,
             paralleles=paralleles, doit_arreter=doit_arreter,
             prereperage=not (source is not None and source.mode in (EXCEL, URL, API)),
             localiser=localiser,
@@ -207,10 +229,16 @@ def mettre_a_jour(
         )
 
     echecs, reussis = attente.calculer_echecs_et_reussites(groupes, resultats)
+    if colonne_id:   # message du moteur écrit pour les ID erreur : préciser la colonne réelle
+        echecs = {i: (f"absent de la colonne « {colonne_id} » du fichier"
+                      if r == "ID erreur introuvable dans le fichier" else r) for i, r in echecs.items()}
+    ecriture = contexte if isinstance(contexte, SessionEcriture) else None
     bilan = BilanMiseAJour(
         resultats=resultats, echecs=echecs, reussis=reussis, simulation=simuler,
-        via_excel=ecrire_via_excel, via_api=via_api, duree=time.perf_counter() - depart,
-        nb_communes_demandees=len(groupes),
+        via_excel=bool(ecriture and ecriture.excel_utilise),
+        via_api=bool(par_api and not simuler and (ecriture is None or ecriture.repli_utilise)),
+        duree=time.perf_counter() - depart, nb_communes_demandees=len(groupes),
+        sans_excel=ecriture.raison_sans_excel if ecriture and ecriture.repli_utilise else "",
     )
     if fichier_attente and not simuler:
         bilan.nb_en_attente = len(attente.mettre_a_jour(fichier_attente, echecs, reussis))
@@ -219,6 +247,15 @@ def mettre_a_jour(
 
 class EcritureSharePointImpossible(RuntimeError):
     """Source SharePoint : la mise à jour exige Excel (co-édition)."""
+
+
+def _synchronise(racine: str) -> bool:
+    """``racine`` est dans une bibliothèque SharePoint synchronisée par OneDrive."""
+    try:
+        from sna.services.onedrive import url_sharepoint
+        return bool(racine) and url_sharepoint(racine) is not None
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _excel_disponible(session_factory) -> bool:

@@ -166,7 +166,27 @@ def test_filtre_et_masquage_retires_avant_ecriture(tmp_path):
 
 
 # ── Verrou (classeur ouvert ailleurs) ──────────────────────────────
-def test_fichier_ouvert_ailleurs_est_signale_sans_rien_ecrire(tmp_path):
+def test_fichier_ouvert_dans_un_autre_excel_est_ecrit_dedans(tmp_path):
+    """Ajout (cf. PROVENANCE.md) : le classeur est déjà ouvert en écriture dans une autre instance
+    d'Excel de la session (l'Excel de l'utilisateur). Notre instance ne l'obtient qu'en lecture
+    seule : les cellules sont alors écrites dans le classeur ouvert, qui est enregistré."""
+    chemin = str(tmp_path / "audit.xlsx")
+    _classeur(chemin, ["ID erreur", "Statut"], [["13001_1", "à revoir"]])
+    config = _config(_regle())
+
+    with _collegue_ouvre(chemin):
+        with SessionExcel() as session:
+            bilan = session.appliquer_regles(chemin, config, ["13001_1"])
+
+    assert not bilan.verrouille and bilan.comptes == {"R1": 1}
+    assert bilan.ouverture == "classeur déjà ouvert dans votre Excel"
+    assert bilan.ids_non_verifies == []
+
+
+def test_fichier_ouvert_ailleurs_introuvable_est_signale_sans_rien_ecrire(tmp_path, monkeypatch):
+    """Ouvert par quelqu'un d'autre (autre poste, introuvable ici) : verrouillé, rien écrit."""
+    from sna.services import excel_com
+    monkeypatch.setattr(excel_com, "_classeur_ouvert_ailleurs", lambda *a, **k: None)
     chemin = str(tmp_path / "audit.xlsx")
     _classeur(chemin, ["ID erreur", "Statut"], [["13001_1", "à revoir"]])
     avant = open(chemin, "rb").read()

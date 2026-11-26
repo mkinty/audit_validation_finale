@@ -25,6 +25,8 @@ from avf.services.mise_a_jour import mettre_a_jour
 from avf.services.navigateur import NavigateurFerme, cookies_pour
 from sna.models.regles import ReglesConfig
 
+from .conftest import imm
+
 HOTE = "contoso.sharepoint.com"
 DOSSIER = "/sites/SNA/Shared Documents/Audit"
 LIEN = "https://contoso.sharepoint.com/sites/SNA/Shared%20Documents/Audit"
@@ -40,6 +42,7 @@ class _FauxSharePoint(http.server.BaseHTTPRequestHandler):
     extraits: dict = {}            # chemins locaux extraits → par qui
     avant_ecriture = None          # rappel(chemin local) juste avant d'accepter une écriture
     ignorer_ecritures = False      # simule un serveur qui « perd » l'écriture
+    telechargement_interdit = False  # simule l'accès conditionnel d'un poste non géré
 
     def _etag(self, local):
         return f'"{{AAAA-BBBB}},{type(self).versions.get(local, 1)}"'
@@ -75,6 +78,10 @@ class _FauxSharePoint(http.server.BaseHTTPRequestHandler):
             if not (local and os.path.isfile(local)):
                 return self._envoyer(404, {"odata.error": {"message": {"value": "fichier introuvable"}}})
             if suite == "/$value":
+                if type(self).telechargement_interdit:     # accès conditionnel (poste non géré)
+                    return self._envoyer(403, {"error": {"code": "accessDenied", "innerError": {
+                        "code": "conditionalAccessPolicyEnforced"}, "message": "En raison des stratégies "
+                        "de l'organisation, vous ne pouvez pas télécharger ces ressources à partir de cet appareil."}})
                 return self._envoyer(200, open(local, "rb").read(), "application/octet-stream",
                                      {"ETag": self._etag(local)})
             if suite == "" and "ETag" in q:
@@ -234,7 +241,7 @@ def test_audit_par_ids_via_l_api(source_api):
     with sp.acces_pour(source_api) as acces:
         r = auditer_communes(["13001"], source_api.racine, source=source_api, acces=acces,
                              ids={"13001": ["13001_2", "13001_404"]})
-    assert r.commune("13001").ids_non_valides == ["13001_2"] and r.ids_introuvables() == ["13001_404"]
+    assert r.commune("13001").ids_non_valides == [imm("13001", 3)] and r.ids_introuvables() == ["13001_404"]
 
 
 def test_session_expiree_pendant_l_audit(source_api, serveur):
@@ -377,7 +384,7 @@ def test_mise_a_jour_par_l_api_sans_excel(source_api, racine, serveur):
     messages = []
     bilan = mettre_a_jour(groupes_depuis_rapport(_audit_api(source_api)), regles, source_api.racine,
                           via_excel=True, session_factory=_PasDExcel(), source=source_api,
-                          on_etape=lambda c, m: messages.append(m))
+                          on_etape=lambda c, m: messages.append(m), colonne_id="ID imm")
     assert bilan.via_api and not bilan.via_excel
     par = {r.commune: r for r in bilan.resultats}
     assert par["13001"].nb_modifications > 0 and par["2A004"].nb_modifications > 0
@@ -385,7 +392,7 @@ def test_mise_a_jour_par_l_api_sans_excel(source_api, racine, serveur):
     assert any("valeurs vérifiées sur SharePoint" in m for m in messages)
     assert any(a.startswith("POST /sites/SNA/_api/contextinfo") for a in faux.appels)
     apres = _audit_api(source_api)                                 # ré-audit sur le serveur
-    assert apres.ids_non_valides_par_commune() == {"75021": ["75021_1"]}
+    assert apres.ids_non_valides_par_commune() == {"75021": [imm("75021", 2)]}
     from openpyxl import load_workbook
     ws = load_workbook(os.path.join(racine, "Dep13", "13001", "audit_13001.xlsx"))["Audit"]
     assert ws["F3"].value == "OK" and ws["D3"].value == datetime(2026, 11, 26)   # vraie date Excel
@@ -433,7 +440,9 @@ def test_fichier_extrait_rien_ecrit(source_api, racine, serveur):
     fichier = os.path.join(racine, "Dep13", "13001", "audit_13001.xlsx")
     faux.extraits[fichier] = "Alice Martin"
     bilan = mettre_a_jour({"13001": ["13001_2"]}, ReglesConfig.defaut(), source_api.racine, source=source_api)
-    assert bilan.resultats[0].message == "classeur verrouillé par Alice Martin"
+    message = bilan.resultats[0].message
+    assert message.startswith("classeur verrouillé par Alice Martin — fichier EXTRAIT (check-out)")
+    assert "réarchivé" in message and "co-édition Excel, indisponible" not in message
 
 
 def test_ecriture_non_retrouvee_id_en_attente(source_api, serveur):
@@ -448,3 +457,31 @@ def test_valeurs_deja_en_place_rien_envoye(source_api, serveur):
     srv, faux = serveur
     mettre_a_jour({"13001": ["13001_1"]}, ReglesConfig(regles=[]), source_api.racine, source=source_api)
     assert not any(a.startswith("POST") for a in faux.appels)
+
+
+
+# ── Accès conditionnel : téléchargement interdit depuis cet appareil ─
+def test_telechargement_interdit_explique_et_arrete_vite(source_api, serveur):
+    srv, faux = serveur
+    faux.telechargement_interdit = True
+    with sp.acces_pour(source_api) as acces:
+        r = auditer_communes(["13001", "13002", "2A004"], source_api.racine, source=source_api, acces=acces)
+    assert all("téléchargement interdit depuis cet appareil" in c.message for c in r.communes)
+    assert "session" not in r.communes[0].message                       # plus de faux « session expirée »
+    telechargements = [a for a in faux.appels if a.endswith("/$value")]
+    assert len(telechargements) == 1                                     # un refus suffit : arrêt
+
+
+def test_telechargement_interdit_en_mise_a_jour(source_api, serveur):
+    srv, faux = serveur
+    faux.telechargement_interdit = True
+    bilan = mettre_a_jour({"13001": ["13001_2"], "13002": ["13002_1"]}, ReglesConfig.defaut(),
+                          source_api.racine, source=source_api)
+    assert all("téléchargement interdit" in r.message for r in bilan.resultats)
+    assert not any(a.startswith("POST") and "$value" in a for a in faux.appels)   # rien écrit
+
+
+def test_messages_d_erreur_sharepoint_deux_formats():
+    assert rest._message_erreur('{"odata.error":{"message":{"value":"Accès refusé"}}}') == "Accès refusé"
+    assert rest._message_erreur('{"error":{"code":"x","message":"Bloqué"}}') == "Bloqué"
+    assert rest._message_erreur("<html>", "Forbidden") == "Forbidden"

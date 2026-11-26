@@ -84,6 +84,8 @@ def controler_ligne(ligne: LigneAudit, colonnes: ColonnesAudit) -> list[Anomalie
         ))
     if est_vide(ligne.auditeur):
         anomalies.append(Anomalie("auditeur", f"{colonnes.auditeur} vide"))
+    if est_vide(ligne.id_imm):
+        anomalies.append(Anomalie("id_imm", f"{colonnes.id_imm} vide (ligne non ciblable par la mise à jour)"))
     attendus_vf = colonnes.valeurs_validation
     if est_vide(ligne.validation):
         anomalies.append(Anomalie("validation", f"{colonnes.validation} vide"))

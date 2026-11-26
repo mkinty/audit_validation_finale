@@ -141,7 +141,7 @@ def test_commune_complete_detail_des_lignes_validees():
     assert '<tr class="l-validee">' in html and '<tr class="l-non-valide">' not in html
     assert 'data-copier="13002"' not in html             # aucun ID non valide à copier
     assert "cocher « Afficher aussi les validées »" in html
-    assert "Aucun ID erreur non valide." in html
+    assert "Aucun ID imm non valide." in html
 
 
 def test_export_ecrit_le_fichier(rapport, tmp_path):
@@ -189,7 +189,7 @@ def test_resume(rapport):
     lignes = p.resume(rapport)
     assert lignes[0].startswith("7 commune(s)")
     assert "3 validée(s)" in lignes[1] and "8 non valide(s)" in lignes[1]
-    assert "7 ID erreur non valide(s) sur 10" in lignes[1]
+    assert "8 ID imm non valide(s) sur 11" in lignes[1]
 
 
 def test_texte_ids():

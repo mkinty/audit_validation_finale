@@ -4,7 +4,8 @@
     racine          → dossier racine des audits (source locale)
     lien_sharepoint → lien SharePoint du dossier racine (source SharePoint)
     communes        → dernière sélection de communes
-    ids_cibles      → ID erreur saisis pour un audit restreint (vide : communes entières)
+    ids_cibles      → ID saisis pour un audit restreint (vide : communes entières)
+    type_ids        → nature de ces ID : « id_erreur » ou « id_imm »
     colonnes        → libellés des colonnes auditées (Validation finale, Audit…)
     regles          → règles de mise à jour, au format de complete_excel_files
                       (``sna.models.regles.ReglesConfig``) : valeurs par défaut
@@ -41,6 +42,7 @@ class Parametres:
     lien_sharepoint: str = ""
     communes: list[str] = field(default_factory=list)
     ids_cibles: list[str] = field(default_factory=list)
+    type_ids: str = "id_erreur"
     colonnes: ColonnesAudit = field(default_factory=ColonnesAudit)
     regles: ReglesConfig = field(default_factory=ReglesConfig.defaut)
     date_du_jour: bool = True
@@ -56,6 +58,7 @@ class Parametres:
             "lien_sharepoint": self.lien_sharepoint,
             "communes": list(self.communes),
             "ids_cibles": list(self.ids_cibles),
+            "type_ids": self.type_ids,
             "colonnes": self.colonnes.to_dict(),
             "regles": self.regles.to_dict(),
             "date_du_jour": self.date_du_jour,
@@ -69,12 +72,13 @@ class Parametres:
     def from_dict(data: dict | None) -> "Parametres":
         data = data if isinstance(data, dict) else {}
         defaut = Parametres()
-        return Parametres(
+        parametres = Parametres(
             source="sharepoint" if data.get("source") == "sharepoint" else "local",
             racine=str(data.get("racine") or ""),
             lien_sharepoint=str(data.get("lien_sharepoint") or "").strip(),
             communes=_liste(data.get("communes")),
             ids_cibles=_liste(data.get("ids_cibles")),
+            type_ids="id_imm" if data.get("type_ids") == "id_imm" else "id_erreur",
             colonnes=ColonnesAudit.from_dict(data.get("colonnes")),
             regles=_regles(data.get("regles")),
             date_du_jour=bool(data.get("date_du_jour", defaut.date_du_jour)),
@@ -83,6 +87,14 @@ class Parametres:
             dossier_export=str(data.get("dossier_export") or ""),
             paralleles=_paralleles(data.get("paralleles", defaut.paralleles)),
         )
+        # Identifiant des mises à jour : l'ID imm (unique par ligne), plus l'ID erreur.
+        # Ancienne configuration : la colonne ID erreur personnalisée était celle des règles.
+        anciennes = data.get("colonnes") if isinstance(data.get("colonnes"), dict) else {}
+        ancien_id = parametres.regles.colonne_id
+        if "id_erreur" not in anciennes and ancien_id and ancien_id != parametres.colonnes.id_imm:
+            parametres.colonnes.id_erreur = ancien_id
+        parametres.regles.colonne_id = parametres.colonnes.id_imm
+        return parametres
 
 
 def charger(fichier: str = CONFIG_FILE) -> Parametres:

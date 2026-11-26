@@ -12,6 +12,8 @@ import pytest
 from avf.config import charger
 from avf.ui import application as module_app
 from avf.models.audit import NON_VALIDES
+
+from .conftest import imm
 from avf.ui import fenetre_rapport
 from avf.ui.composants import DialogueColonnes, DialogueSaisie
 from openpyxl import load_workbook
@@ -65,6 +67,7 @@ def app(tmp_path, dialogues):
         fichier_config=str(tmp_path / "cfg.json"), fichier_attente=str(tmp_path / "attente.json"),
     )
     a.withdraw()
+    attendre(a)   # sélection restaurée en arrière-plan
     a.var_excel.set(False)  # tests : réécriture directe, jamais Excel
     yield a
     a.destroy()
@@ -132,6 +135,7 @@ def test_renseigner_des_communes(app, racine, dialogues, monkeypatch):
     app._enregistrer_racine()
     monkeypatch.setattr(DialogueSaisie, "montrer", lambda self: "13001 2a004, 88888")
     app._renseigner_communes()
+    attendre(app)
     assert app.liste_com.codes == ["13001", "2A004"]
     assert app._communes_choisies() == ["13001", "2A004"]
     assert any("88888" in m for _, m in dialogues)
@@ -142,6 +146,7 @@ def test_saisie_annulee(app, racine, monkeypatch):
     app._enregistrer_racine()
     monkeypatch.setattr(DialogueSaisie, "montrer", lambda self: None)
     app._renseigner_communes()
+    attendre(app)
     assert app.liste_com.codes == []
 
 
@@ -155,8 +160,8 @@ def test_audit_rapport_copie_mise_a_jour_reaudit_export(app, racine, tmp_path):
     attendre(app)
 
     r = app.rapport
-    assert (r.nb_lignes_valides, r.nb_lignes_non_valides, r.nb_ids_non_valides) == (3, 8, 7)
-    assert "7 ID non valides" in app.btn_maj["text"]
+    assert (r.nb_lignes_valides, r.nb_lignes_non_valides, r.nb_ids_non_valides) == (3, 8, 8)
+    assert "8 ID non valides" in app.btn_maj["text"]
     journal = app.txt_log.get("1.0", tk.END)
     assert "13001 — 6 ligne(s) · 1 validée(s) · 5 non valide(s)" in journal and "75020" in journal
     assert "Ligne validée si : Audit = OK / KO" in journal
@@ -172,19 +177,22 @@ def test_audit_rapport_copie_mise_a_jour_reaudit_export(app, racine, tmp_path):
     # Détail de la commune : lignes non valides par défaut, avec Validation finale et motifs
     f.arbre.selection_set("13001")
     f.update()
-    assert f.detail["columns"][6] == "vf" and f.detail.heading("vf")["text"] == "Validation finale"
+    assert f.detail["columns"][:2] == ("imm", "id")                 # ID imm avant ID erreur
+    assert f.detail["columns"][7] == "vf" and f.detail.heading("vf")["text"] == "Validation finale"
     lignes = [_ligne_detail(f, iid) for iid in f.detail.get_children()]
-    assert [(l["id"], l["ligne"]) for l in lignes] == [
-        ("13001_2", "3"), ("13001_3", "4"), ("13001_4", "5"), ("13001_5", "6"), ("13001_5", "7"),
+    assert [(l["imm"], l["id"], l["ligne"]) for l in lignes] == [
+        (imm("13001", 3), "13001_2", "3"), (imm("13001", 4), "13001_3", "4"), (imm("13001", 5), "13001_4", "5"),
+        (imm("13001", 6), "13001_5", "6"), (imm("13001", 7), "13001_5", "7"),
     ]
     assert lignes[2]["vf"] == "Validé" and lignes[2]["motifs"] == "Validation finale « Validé » ≠ OK"
     assert lignes[2]["statut"] == "⚠️ Non valide"
-    f._copier_commune()
-    assert f.clipboard_get() == "13001_2\n13001_3\n13001_4\n13001_5"
-    # Lignes de 13001_5 sélectionnées : l'ID n'est copié qu'une fois
-    f.detail.selection_set([iid for iid in f.detail.get_children() if iid.startswith("13001_5")])
+    f._copier_commune()                                           # les ID imm, pas les ID erreur
+    assert f.clipboard_get() == "\n".join(imm("13001", n) for n in (3, 4, 5, 6, 7))
+    # Les deux lignes de 13001_5 sélectionnées : leurs deux ID imm
+    f.detail.selection_set([iid for iid in f.detail.get_children()
+                            if _ligne_detail(f, iid)["id"] == "13001_5"])
     f._copier_selection_detail()
-    assert f.clipboard_get() == "13001_5"
+    assert f.clipboard_get() == f"{imm('13001', 6)}\n{imm('13001', 7)}"
     f.var_separateur.set("virgule")
     f._copier_affiches()
     assert f.clipboard_get().split(", ") == r.ids_de(NON_VALIDES)
@@ -194,12 +202,12 @@ def test_audit_rapport_copie_mise_a_jour_reaudit_export(app, racine, tmp_path):
     f.case_tous.invoke()
     lignes = [_ligne_detail(f, i) for i in f.detail.get_children()]
     assert [l["ligne"] for l in lignes] == ["2", "3", "4", "5", "6", "7"]
-    assert lignes[0]["id"] == "13001_1" and lignes[0]["statut"] == "✅ Validée"
+    assert lignes[0]["imm"] == imm("13001", 2) and lignes[0]["statut"] == "✅ Validée"
     assert f.detail.item(f.detail.get_children()[0], "tags") == ("validee",)
     f.var_separateur.set("ligne")
     f._copier_commune()                                   # la copie reste celle des non valides
-    assert f.clipboard_get() == "13001_2\n13001_3\n13001_4\n13001_5"
-    assert "(7)" in f.btn_copier_affiches["text"]
+    assert f.clipboard_get() == "\n".join(imm("13001", n) for n in (3, 4, 5, 6, 7))
+    assert "(8)" in f.btn_copier_affiches["text"]
     f.case_tous.invoke()
     assert len(f.detail.get_children()) == 5
     # Commune complète : rien par défaut, ses lignes avec la case cochée
@@ -235,7 +243,7 @@ def test_audit_rapport_copie_mise_a_jour_reaudit_export(app, racine, tmp_path):
     f._maj_tout()
     attendre(app)
     attendre(app)  # le ré-audit est relancé à la fin de la mise à jour
-    assert app.rapport.ids_non_valides_par_commune() == {"75021": ["75021_1"]}  # conflit refusé
+    assert app.rapport.ids_non_valides_par_commune() == {"75021": [imm("75021", 2)]}  # conflit refusé
     assert f.tuiles["non_valides"][0]["text"] == "1"
     journal = app.txt_log.get("1.0", tk.END)
     assert "Ré-audit" in journal and "conflit" in journal
@@ -244,7 +252,7 @@ def test_audit_rapport_copie_mise_a_jour_reaudit_export(app, racine, tmp_path):
     chemin = app._exporter("html", str(tmp_path / "rapport.html"), ouvrir=False)
     assert "75021_1" in open(chemin, encoding="utf-8").read()
     chemin = app._exporter("xlsx", str(tmp_path / "rapport.xlsx"), ouvrir=False)
-    assert load_workbook(chemin).sheetnames == ["Synthèse", "Communes", "Lignes", "ID non valides"]
+    assert load_workbook(chemin).sheetnames == ["Synthèse", "Communes", "Lignes", "ID imm non valides"]
     chemin = app._exporter("csv", str(tmp_path / "rapport.csv"), ouvrir=False)
     assert "75021_1" in open(chemin, encoding="utf-8-sig").read()
     assert charger(app.fichier_config).dossier_export == str(tmp_path)
@@ -294,7 +302,7 @@ def test_simulation_ne_modifie_rien(app, racine):
     assert "simulation" in app.txt_log.get("1.0", tk.END)
     app._lancer_audit(["13001"])
     attendre(app)
-    assert app.rapport.commune("13001").nb_ids_non_valides == 4
+    assert app.rapport.commune("13001").nb_ids_non_valides == 5
 
 
 def test_refus_de_confirmation(app, racine, monkeypatch):
@@ -306,7 +314,7 @@ def test_refus_de_confirmation(app, racine, monkeypatch):
     assert not app.occupe
     app._lancer_audit(["13001"])
     attendre(app)
-    assert app.rapport.commune("13001").nb_ids_non_valides == 4
+    assert app.rapport.commune("13001").nb_ids_non_valides == 5
 
 
 def test_colonnes_auditees(app, racine, monkeypatch):
@@ -324,6 +332,7 @@ def test_options_et_selection_persistees(tmp_path, racine, dialogues):
     cfg = str(tmp_path / "cfg.json")
     a = module_app.Application(fichier_config=cfg, fichier_attente=str(tmp_path / "att.json"))
     a.withdraw()
+    attendre(a)   # sélection restaurée en arrière-plan
     preparer(a, racine)
     a.liste_com.selection_clear(0, tk.END)
     a.liste_com.selection_set(1)  # 13002
@@ -335,6 +344,7 @@ def test_options_et_selection_persistees(tmp_path, racine, dialogues):
 
     b = module_app.Application(fichier_config=cfg, fichier_attente=str(tmp_path / "att.json"))
     b.withdraw()
+    attendre(b)   # sélection restaurée en arrière-plan
     try:
         assert b.var_racine.get() == racine
         assert b.liste_com.codes == ["13002"]
@@ -383,7 +393,7 @@ def test_arret_pendant_la_mise_a_jour(app, racine, monkeypatch):
     assert "Arrêt demandé" in app.txt_log.get("1.0", tk.END)
     app._lancer_audit()
     attendre(app)
-    assert app.rapport.nb_ids_non_valides == 7   # rien n'a été écrit
+    assert app.rapport.nb_ids_non_valides == 8   # rien n'a été écrit
 
 
 def test_dialogue_colonnes_valeurs_acceptees(app):
@@ -500,6 +510,7 @@ def test_source_sharepoint_retrouvee_au_lancement(tmp_path, racine, monkeypatch,
               open(cfg, "w", encoding="utf-8"))
     a = module_app.Application(fichier_config=cfg, fichier_attente=str(tmp_path / "att.json"))
     a.withdraw()
+    attendre(a)   # sélection restaurée en arrière-plan
     try:
         fin = time.time() + 10
         while a._source() is None and time.time() < fin:   # connexion automatique, en arrière-plan
@@ -518,6 +529,7 @@ def test_source_sharepoint_retrouvee_au_lancement(tmp_path, racine, monkeypatch,
 def _saisir_ids(app, monkeypatch, texte):
     monkeypatch.setattr(DialogueSaisie, "montrer", lambda self: texte)
     app._renseigner_ids()
+    attendre(app)
 
 
 def test_audit_par_ids_puis_mise_a_jour_et_reaudit(app, racine, monkeypatch, dialogues):
@@ -545,7 +557,7 @@ def test_audit_par_ids_puis_mise_a_jour_et_reaudit(app, racine, monkeypatch, dia
     assert r.par_ids and r.nb_lignes == 4 and r.nb_ids_non_valides == 0
     # Hors périmètre, rien n'a été touché : 2A004_1 reste non valide
     complet = module_app.auditer_communes(["2A004"], racine)
-    assert complet.commune("2A004").ids_non_valides == ["2A004_1"]
+    assert complet.commune("2A004").ids_non_valides == [imm("2A004", 2)]
 
 
 def test_saisie_ids_signale_les_problemes(app, racine, monkeypatch, dialogues):
@@ -553,7 +565,8 @@ def test_saisie_ids_signale_les_problemes(app, racine, monkeypatch, dialogues):
     app._enregistrer_racine()
     _saisir_ids(app, monkeypatch, "13001_2 99999_1 13002")
     messages = " ".join(m for _, m in dialogues)
-    assert "99999 : 99999_1" in messages and "sans numéro" in messages and "13002" in messages
+    assert "1 commune(s) sans dossier" in messages and "99999" in messages
+    assert "sans numéro" in messages and "13002" in messages
     assert app.liste_com.codes == ["13001"]
 
 
@@ -587,6 +600,7 @@ def test_ids_saisis_retrouves_au_lancement(tmp_path, racine, dialogues):
               open(cfg, "w", encoding="utf-8"))
     a = module_app.Application(fichier_config=cfg, fichier_attente=str(tmp_path / "att.json"))
     a.withdraw()
+    attendre(a)   # sélection restaurée en arrière-plan
     try:
         assert a.ids_cibles == {"13001": ["13001_2"], "2A004": ["2A004_1"]}
         assert a.liste_com.codes == ["13001", "2A004"] and a._communes_choisies() == ["2A004"]
@@ -610,6 +624,7 @@ def test_mode_adresse_saisie_sans_parcours(app, monkeypatch, dialogues):
     assert app.liste_com.codes == ["38153"]              # retenue sans dossier vérifiable
     monkeypatch.setattr(DialogueSaisie, "montrer", lambda self: "38153 38154")
     app._renseigner_communes()
+    attendre(app)
     assert app.liste_com.codes == ["38153", "38154"]
 
 
@@ -683,11 +698,12 @@ def test_connexion_navigateur_detection_et_audit_par_l_api(app, racine, client, 
         app._lancer_audit()
         attendre(app)
         r = app.rapport
-        assert r.source.mode == API and r.nb_ids_non_valides == 7
+        assert r.source.mode == API and r.nb_ids_non_valides == 8
         assert r.commune("13001").chemin == LIEN_API + "/Dep13/13001/audit_13001.xlsx"
         # Saisie d'ID : l'existence du dossier de commune est vérifiée par l'API
         monkeypatch.setattr(DialogueSaisie, "montrer", lambda self: "13001_2 99999_1")
         app._renseigner_ids()
+        attendre(app)
         assert app.liste_com.codes == ["13001"]
     finally:
         sharepoint._CLIENTS.clear()
@@ -716,18 +732,132 @@ def test_mise_a_jour_avec_la_connexion_navigateur_sans_excel(app, racine, client
         app._excel = False                                   # « impossible de démarrer Excel »
         monkeypatch.setattr(DialogueSaisie, "montrer", lambda self: "13001_2 13001_5")
         app._renseigner_ids()
+        attendre(app)
         app._lancer_audit()
         attendre(app)
-        assert app.rapport.nb_ids_non_valides == 2
+        assert app.rapport.nb_ids_non_valides == 3          # 13001_2 + 13001_5 (deux logements)
         app.fenetre_rapport._maj_tout()
         attendre(app)
         attendre(app)                                        # ré-audit par l'API
         journal = app.txt_log.get("1.0", tk.END)
-        assert "Écriture par l'API SharePoint avec votre connexion" in journal
+        assert "API SharePoint avec votre connexion (navigateur)" in journal
         assert "valeurs vérifiées sur SharePoint" in journal
         assert app.rapport.nb_ids_non_valides == 0
         confirmation = next(m for t, m in dialogues if t == "Confirmer la mise à jour")
-        assert "avec votre connexion SharePoint (navigateur)" in confirmation
+        assert "ligne par ligne (ID imm) : API SharePoint avec votre connexion (navigateur)" in confirmation
         assert not any("Excel" in t for t, _ in dialogues)
     finally:
         sharepoint._CLIENTS.clear()
+
+
+# ── Vider les communes ou les ID erreur ───────────────────────────
+def test_vider_les_communes(app, racine):
+    preparer(app, racine)
+    assert str(app.btn_vider_com["state"]) == "normal"
+    assert str(app.btn_vider_ids["state"]) == "disabled"          # aucun ID saisi
+    app._vider_communes()
+    assert app.liste_com.codes == [] and charger(app.fichier_config).communes == []
+    assert str(app.btn_vider_com["state"]) == "disabled" and str(app.btn_audit["state"]) == "disabled"
+    app.traiter_file()
+    assert "Liste des communes vidée (6 commune(s))" in app.txt_log.get("1.0", tk.END)
+
+
+def test_vider_les_id_erreur(app, racine, monkeypatch):
+    app.var_racine.set(racine)
+    app._enregistrer_racine()
+    _saisir_ids(app, monkeypatch, "13001_2 13001_5 2a004_2")
+    attendre(app)
+    assert str(app.btn_vider_ids["state"]) == "normal"
+    app._vider_ids()
+    assert app.ids_cibles == {} and app.liste_com.codes == []
+    assert not app.cadre_perimetre.winfo_manager()
+    cfg = charger(app.fichier_config)
+    assert cfg.ids_cibles == [] and cfg.communes == []
+    assert str(app.btn_vider_ids["state"]) == "disabled"
+    app.traiter_file()
+    assert "3 ID erreur saisi(s) vidé(s)" in app.txt_log.get("1.0", tk.END)
+
+
+def test_vider_les_communes_oublie_aussi_les_id(app, racine, monkeypatch):
+    app.var_racine.set(racine)
+    app._enregistrer_racine()
+    _saisir_ids(app, monkeypatch, "13001_2")
+    attendre(app)
+    app._vider_communes()
+    assert app.ids_cibles == {} and charger(app.fichier_config).ids_cibles == []
+
+
+def test_communes_entieres_desactive_vider_les_id(app, racine, monkeypatch):
+    app.var_racine.set(racine)
+    app._enregistrer_racine()
+    _saisir_ids(app, monkeypatch, "13001_2")
+    attendre(app)
+    app._effacer_ids()                         # « ✖ Communes entières » : garde les communes
+    assert app.liste_com.codes == ["13001"]
+    assert str(app.btn_vider_ids["state"]) == "disabled" and str(app.btn_vider_com["state"]) == "normal"
+
+
+# ── 🆔 ID imm : saisie, audit ciblé, mise à jour ligne par ligne ───
+def _saisir_imm(app, monkeypatch, texte):
+    monkeypatch.setattr(DialogueSaisie, "montrer", lambda self: texte)
+    app._renseigner_ids("id_imm")
+    attendre(app)
+
+
+def test_id_imm_audit_et_mise_a_jour_d_un_seul_logement(app, racine, monkeypatch, dialogues):
+    """13001_5 couvre deux logements : on ne met à jour que celui de la ligne 7."""
+    app.var_racine.set(racine)
+    app._enregistrer_racine()
+    _saisir_imm(app, monkeypatch, f"ID imm\n{imm('13001', 7)}\nID-9999900000AB")
+    assert app.liste_com.codes == ["13001"] and app.type_cibles == "id_imm"
+    assert "🆔 Audit limité à 1 ID imm sur 1 commune(s)" in app.lbl_perimetre["text"]
+    assert any("1 commune(s) sans dossier" in m and "99999" in m for _, m in dialogues)
+    cfg = charger(app.fichier_config)
+    assert cfg.ids_cibles == [imm("13001", 7)] and cfg.type_ids == "id_imm"
+
+    app._lancer_audit()
+    attendre(app)
+    r = app.rapport
+    assert r.type_ids == "id_imm" and r.nb_lignes == 1 and r.ids_de(NON_VALIDES) == [imm("13001", 7)]
+    app.fenetre_rapport.arbre.selection_set("13001")
+    app.fenetre_rapport.update()
+    app.fenetre_rapport._copier_commune()
+    assert app.fenetre_rapport.clipboard_get() == imm("13001", 7)
+
+    app.fenetre_rapport._maj_tout()
+    attendre(app)
+    attendre(app)
+    assert app.rapport.nb_ids_non_valides == 0
+    complet = module_app.auditer_communes(["13001"], racine).commune("13001")
+    assert imm("13001", 7) not in complet.ids_non_valides
+    assert imm("13001", 6) in complet.ids_non_valides       # l'autre logement de 13001_5 : intact
+    journal = app.txt_log.get("1.0", tk.END)
+    assert "identifiant des lignes : « ID imm »" in journal
+
+
+def test_id_imm_retrouves_au_lancement(tmp_path, racine, dialogues):
+    import json
+    cfg = str(tmp_path / "cfg.json")
+    json.dump({"racine": racine, "ids_cibles": [imm("13001", 3), imm("2A004", 2)], "type_ids": "id_imm"},
+              open(cfg, "w", encoding="utf-8"))
+    a = module_app.Application(fichier_config=cfg, fichier_attente=str(tmp_path / "att.json"))
+    a.withdraw()
+    attendre(a)
+    try:
+        assert a.type_cibles == "id_imm"
+        assert a.ids_cibles == {"13001": [imm("13001", 3)], "2A004": [imm("2A004", 2)]}
+        assert "2 ID imm" in a.lbl_perimetre["text"]
+    finally:
+        a.destroy()
+        gc.collect()
+
+
+def test_dialogue_colonnes_id_imm_et_id_erreur(app):
+    from avf.models.colonnes import ColonnesAudit
+    d = DialogueColonnes(app, ColonnesAudit(), "ID imm", 1)
+    assert d.vars["colonne_id"].get() == "ID imm" and d.vars["id_erreur"].get() == "ID erreur"
+    d.vars["colonne_id"].set("N° immeuble")
+    d.vars["id_erreur"].set("Erreur")
+    d._valider()
+    colonnes, colonne_id, _ = d.resultat
+    assert (colonnes.id_imm, colonnes.id_erreur, colonne_id) == ("N° immeuble", "Erreur", "N° immeuble")

@@ -25,7 +25,9 @@ import time
 
 from sna.services.identifiants import normaliser_id
 
-from ..models.audit import AuditCommune, IdErreurAudit, LigneAudit, RapportAudit, StatutAudit
+from ..models.audit import (
+    PAR_ID_ERREUR, PAR_ID_IMM, AuditCommune, IdAudit, LigneAudit, RapportAudit, StatutAudit,
+)
 from ..models.colonnes import ColonnesAudit
 from ..models.source import SourceAudit
 from .controle import controler
@@ -52,6 +54,7 @@ def auditer_communes(
     source: SourceAudit | None = None,
     acces: AccesFichiers | None = None,
     ids: Mapping[str, Sequence[str]] | None = None,
+    type_ids: str = PAR_ID_ERREUR,
 ) -> RapportAudit:
     """Audite chaque commune et retourne le rapport complet.
 
@@ -68,7 +71,8 @@ def auditer_communes(
     ou SharePoint, cf. ``services.sharepoint`` — et ``acces`` comment les lire
     (déjà ouvert par l'appelant ; par défaut : lecture directe).
 
-    ``ids`` (facultatif) restreint l'audit à des **ID erreur** saisis :
+    ``ids`` (facultatif) restreint l'audit à des ID saisis — **ID erreur** ou **ID imm**
+    selon ``type_ids`` :
     ``{commune: [ID erreur]}`` (cf. ``sna.services.identifiants.groupes_depuis_texte``).
     Seules leurs lignes sont contrôlées ; un ID absent du fichier est signalé
     (``AuditCommune.ids_introuvables``). Une commune de ``communes`` absente de
@@ -85,7 +89,7 @@ def auditer_communes(
 
     def auditer(code: str) -> AuditCommune:
         return auditer_commune(code, racine, colonne_id, colonnes, ligne_entete, on_etape=on_etape,
-                               acces=acces, ids=cibles.get(code))
+                               acces=acces, ids=cibles.get(code), type_ids=type_ids)
 
     _progresser(on_progression, 0, total, "Démarrage…")
     if paralleles > 1 and total > 1:
@@ -116,6 +120,7 @@ def auditer_commune(
     on_etape: CallbackEtape | None = None,
     acces: AccesFichiers | None = None,
     ids: Sequence[str] | None = None,
+    type_ids: str = PAR_ID_ERREUR,
 ) -> AuditCommune:
     """Audite une seule commune (ne lève jamais).
 
@@ -130,6 +135,7 @@ def auditer_commune(
     resultat = AuditCommune(commune=code, departement=departement_de(code))
     if ids is not None:
         resultat.ids_demandes = list(dict.fromkeys(normaliser_id(i) for i in ids if normaliser_id(i)))
+        resultat.type_ids = type_ids
 
     def etape(message: str) -> None:
         if on_etape is not None:
@@ -173,15 +179,20 @@ def auditer_commune(
     lignes = lecture.lignes
     if resultat.ids_demandes is not None:
         voulus = set(resultat.ids_demandes)
-        lignes = [l for l in lignes if normaliser_id(l.id_erreur) in voulus]
-        trouves = {normaliser_id(l.id_erreur) for l in lignes}
+        cle = (lambda l: normaliser_id(l.id_imm)) if type_ids == PAR_ID_IMM else (lambda l: normaliser_id(l.id_erreur))
+        lignes = [l for l in lignes if cle(l) in voulus]
+        trouves = {cle(l) for l in lignes}
         resultat.ids_introuvables = [i for i in resultat.ids_demandes if i not in trouves]
         if resultat.ids_introuvables:
+            nature = colonnes.id_imm if type_ids == PAR_ID_IMM else colonnes.id_erreur
             resultat.avertissements.append(
-                f"{len(resultat.ids_introuvables)} ID erreur introuvable(s) dans le fichier : "
+                f"{len(resultat.ids_introuvables)} {nature} introuvable(s) dans le fichier : "
                 + ", ".join(resultat.ids_introuvables)
+                + (" — un ID imm peut se trouver dans le fichier d'une autre commune que celle de son "
+                   "préfixe" if type_ids == PAR_ID_IMM else "")
             )
     resultat.ids = regrouper_par_id(controler(lignes, colonnes))
+    resultat.avertissements.extend(_qualite_identifiants(resultat, colonnes))
     resultat.avertissements.extend(lecture.avertissements)
     resultat.nb_lignes_lues = lecture.nb_lignes_lues
     resultat.duree = time.perf_counter() - depart
@@ -192,19 +203,41 @@ def auditer_commune(
     return resultat
 
 
-def regrouper_par_id(lignes: Iterable[LigneAudit]) -> list[IdErreurAudit]:
-    """Regroupe les lignes par ID erreur (forme normalisée), ordre d'apparition.
+def _qualite_identifiants(c: AuditCommune, colonnes: ColonnesAudit) -> list[str]:
+    """Anomalies d'identifiants qui comptent pour la mise à jour par ID imm."""
+    from .detection import insee_de_id_imm
+    messages = []
+    doublons = [i.identifiant for i in c.identifiables if i.doublon]
+    if doublons:
+        messages.append(f"{len(doublons)} {colonnes.id_imm} en double (la mise à jour modifiera chacune "
+                        f"de leurs lignes) : " + ", ".join(doublons[:20]) + ("…" if len(doublons) > 20 else ""))
+    sans = [l.ligne for l in c.lignes if not normaliser_id(l.id_imm)]
+    if sans:
+        messages.append(f"{len(sans)} ligne(s) sans {colonnes.id_imm} (non ciblables par la mise à jour) : "
+                        "ligne(s) " + ", ".join(map(str, sans[:20])) + ("…" if len(sans) > 20 else ""))
+    ailleurs = [i.identifiant for i in c.identifiables
+                if insee_de_id_imm(i.identifiant) and insee_de_id_imm(i.identifiant) != c.commune]
+    if ailleurs:
+        messages.append(f"{len(ailleurs)} {colonnes.id_imm} au code d'une autre commune (à saisir via leur "
+                        "commune réelle) : " + ", ".join(ailleurs[:20]) + ("…" if len(ailleurs) > 20 else ""))
+    return messages
 
-    La normalisation est celle de la mise à jour (``normaliser_id`` : espaces
-    supprimés, majuscules) : un ID vu « 13001_1 » ici sera bien retrouvé par
-    le moteur ``sna`` au moment d'écrire.
+
+def regrouper_par_id(lignes: Iterable[LigneAudit]) -> list[IdAudit]:
+    """Regroupe les lignes par **ID imm** (forme normalisée), dans l'ordre d'apparition.
+
+    L'ID imm est l'identifiant unique d'une ligne : c'est lui que l'on copie et que la
+    mise à jour cible. Un ID imm en double (anomalie) regroupe ses lignes. Les lignes
+    sans ID imm forment un groupe sans identifiant : affichées et comptées, mais jamais
+    copiées ni mises à jour. La normalisation est celle de la mise à jour
+    (``normaliser_id`` : espaces supprimés, majuscules).
     """
-    groupes: dict[str, IdErreurAudit] = {}
+    groupes: dict[str, IdAudit] = {}
     for ligne in lignes:
-        cle = normaliser_id(ligne.id_erreur)
-        if not cle:
+        if not normaliser_id(ligne.id_imm) and not normaliser_id(ligne.id_erreur):
             continue
-        groupes.setdefault(cle, IdErreurAudit(id_erreur=cle)).lignes.append(ligne)
+        cle = normaliser_id(ligne.id_imm)
+        groupes.setdefault(cle, IdAudit(identifiant=cle)).lignes.append(ligne)
     return list(groupes.values())
 
 

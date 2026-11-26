@@ -62,10 +62,10 @@ class LectureAudit:
 def lire_audit(
     chemin: str, colonne_id: str, colonnes: ColonnesAudit, ligne_entete: int = 1,
 ) -> LectureAudit:
-    """Lit les lignes portant un ID erreur et leurs colonnes d'audit.
+    """Lit les lignes portant un ID erreur ou un ID imm, et leurs colonnes d'audit.
 
     Raises:
-        ColonneAbsente: colonne des ID erreur ou colonne contrôlée absente.
+        ColonneAbsente: colonne des ID erreur, des ID imm ou colonne contrôlée absente.
         sna.services.colonnes_excel.OngletIntrouvable: aucun onglet « Audit ».
     """
     try:
@@ -81,21 +81,24 @@ def _lire_rapide(chemin, colonne_id, colonnes, ligne_entete) -> LectureAudit:
     entetes = lire_entetes(chemin, ligne_entete)
     if not entetes:
         raise LectureImpossible("ligne d'en-tête vide")
-    index_id, index_info, avertissements = _resoudre(entetes, colonne_id, colonnes)
+    index_id, index_imm, index_info, avertissements = _resoudre(entetes, colonne_id, colonnes)
 
-    ids: dict[int, str] = {}
     derniere = ligne_entete
-    for ligne, valeur in lire_colonne(chemin, index_id, ligne_entete + 1):
-        derniere = max(derniere, ligne)
-        if str(valeur).strip():
-            ids[ligne] = str(valeur).strip()
+    identifiants: dict[str, dict[int, str]] = {"id_erreur": {}, "id_imm": {}}
+    for cle, index in (("id_erreur", index_id), ("id_imm", index_imm)):
+        for ligne, valeur in lire_colonne(chemin, index, ligne_entete + 1):
+            texte = formater_valeur(valeur, brut=True)
+            if texte:
+                derniere = max(derniere, ligne)
+                identifiants[cle][ligne] = texte
+    lignes = set(identifiants["id_erreur"]) | set(identifiants["id_imm"])
 
     valeurs = {}
     for cle, (index, en_date) in index_info.items():
-        valeurs[cle] = _colonne(chemin, index, ligne_entete, ids, en_date=en_date)
+        valeurs[cle] = _colonne(chemin, index, ligne_entete, lignes, en_date=en_date)
 
     return LectureAudit(
-        lignes=_assembler(ids, valeurs),
+        lignes=_assembler(identifiants, valeurs),
         avertissements=avertissements,
         nb_lignes_lues=max(derniere - ligne_entete, 0),
     )
@@ -116,11 +119,11 @@ def _lire_openpyxl(chemin, colonne_id, colonnes, ligne_entete) -> LectureAudit:
     try:
         feuille = choisir_feuille(classeur)
         entetes = entetes_depuis_feuille(feuille, ligne_entete)
-        index_id, index_info, avertissements = _resoudre(entetes, colonne_id, colonnes)
-        utiles = [index_id, *(i for i, _ in index_info.values())]
+        index_id, index_imm, index_info, avertissements = _resoudre(entetes, colonne_id, colonnes)
+        utiles = [index_id, index_imm, *(i for i, _ in index_info.values())]
         col_min, col_max = min(utiles), max(utiles)
 
-        ids: dict[int, str] = {}
+        identifiants: dict[str, dict[int, str]] = {"id_erreur": {}, "id_imm": {}}
         valeurs: dict[str, dict[int, str]] = {k: {} for k in index_info}
         ligne = ligne_entete
         for ligne, rangee in enumerate(
@@ -133,15 +136,18 @@ def _lire_openpyxl(chemin, colonne_id, colonnes, ligne_entete) -> LectureAudit:
                 rang = index - col_min
                 return rangee[rang] if rang < len(rangee) else None
 
-            identifiant = lire(index_id)
-            if identifiant is None or not str(identifiant).strip():
+            id_erreur, id_imm = formater_valeur(lire(index_id)), formater_valeur(lire(index_imm))
+            if not id_erreur and not id_imm:
                 continue
-            ids[ligne] = str(identifiant).strip()
+            if id_erreur:
+                identifiants["id_erreur"][ligne] = id_erreur
+            if id_imm:
+                identifiants["id_imm"][ligne] = id_imm
             for cle, (index, en_date) in index_info.items():
                 valeurs[cle][ligne] = formater_valeur(lire(index), en_date=en_date)
 
         return LectureAudit(
-            lignes=_assembler(ids, valeurs),
+            lignes=_assembler(identifiants, valeurs),
             avertissements=avertissements,
             nb_lignes_lues=max(ligne - ligne_entete, 0),
         )
@@ -166,6 +172,12 @@ def _resoudre(entetes: dict[int, str], colonne_id: str, colonnes: ColonnesAudit)
     index_id = trouver(colonne_id)
     if index_id is None:
         raise ColonneAbsente(f"colonne « {colonne_id} » (ID erreur) introuvable")
+    index_imm = trouver(colonnes.id_imm)
+    if index_imm is None:
+        raise ColonneAbsente(
+            f"colonne « {colonnes.id_imm} » introuvable — c'est l'identifiant unique de chaque ligne, "
+            "utilisé par les mises à jour"
+        )
 
     index_info: dict[str, tuple[int, bool]] = {}
     absentes = []
@@ -182,20 +194,23 @@ def _resoudre(entetes: dict[int, str], colonne_id: str, colonnes: ColonnesAudit)
             f"colonne{pluriel} {', '.join(absentes)} introuvable{pluriel} — "
             "les quatre colonnes contrôlées sont obligatoires"
         )
-    return index_id, index_info, []
+    return index_id, index_imm, index_info, []
 
 
-def _assembler(ids: dict[int, str], valeurs: dict[str, dict[int, str]]) -> list[LigneAudit]:
+def _assembler(identifiants: dict[str, dict[int, str]], valeurs: dict[str, dict[int, str]]) -> list[LigneAudit]:
+    """Une ligne par ligne portant un ID erreur **ou** un ID imm."""
+    lignes = sorted(set(identifiants["id_erreur"]) | set(identifiants["id_imm"]))
     return [
         LigneAudit(
             ligne=ligne,
-            id_erreur=identifiant,
+            id_erreur=identifiants["id_erreur"].get(ligne, ""),
+            id_imm=identifiants["id_imm"].get(ligne, ""),
             validation=valeurs.get("validation", {}).get(ligne, ""),
             audit=valeurs.get("audit", {}).get(ligne, ""),
             date_audit=valeurs.get("date_audit", {}).get(ligne, ""),
             auditeur=valeurs.get("auditeur", {}).get(ligne, ""),
         )
-        for ligne, identifiant in sorted(ids.items())
+        for ligne in lignes
     ]
 
 

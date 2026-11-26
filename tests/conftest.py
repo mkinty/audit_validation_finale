@@ -8,25 +8,50 @@ import os
 import pytest
 from openpyxl import Workbook
 
-ENTETES = ["ID erreur", "Adresse", "Audit", "Date audit", "Auditeur", "Validation finale"]
+ENTETES = ["ID erreur", "Adresse", "Audit", "Date audit", "Auditeur", "Validation finale", "ID imm"]
+
+
+def imm(id_erreur_ou_insee: str, ligne: int) -> str:
+    """ID imm généré par les fixtures pour la ligne Excel ``ligne`` : ``ID-<INSEE><ligne sur 7 chiffres>``."""
+    return f"ID-{str(id_erreur_ou_insee)[:5].upper()}{ligne:07d}"
 
 
 def ecrire_audit(
     chemin: str, lignes: list[list], entetes: list[str] = ENTETES, nom_feuille: str = "Audit",
     autres_feuilles: tuple[str, ...] = (),
 ) -> str:
-    """Écrit un classeur audit : ``lignes`` = valeurs dans l'ordre des en-têtes."""
+    """Écrit un classeur audit : ``lignes`` = valeurs dans l'ordre des en-têtes.
+
+    Si la colonne « ID imm » est attendue mais absente d'une ligne, elle est complétée par
+    un ID imm unique (cf. :func:`imm`) quand la ligne porte un ID erreur.
+    """
     os.makedirs(os.path.dirname(chemin), exist_ok=True)
     wb = Workbook()
     ws = wb.active
     ws.title = nom_feuille
     ws.append(entetes)
-    for ligne in lignes:
+    rang_imm = entetes.index("ID imm") if "ID imm" in entetes else None
+    for numero, ligne in enumerate(lignes, start=2):
+        ligne = list(ligne)
+        if rang_imm is not None and len(ligne) <= rang_imm:
+            ligne += [None] * (rang_imm - len(ligne))
+            ligne.append(imm(ligne[0], numero) if ligne and ligne[0] else None)
         ws.append(ligne)
     for nom in autres_feuilles:
         wb.create_sheet(nom)["A1"] = "ne pas lire"
     wb.save(chemin)
     return chemin
+
+
+@pytest.fixture(autouse=True)
+def sans_vrai_excel_a_la_demande(request, monkeypatch):
+    """La mise à jour démarre Excel à la demande pour un fichier ouvert ou refusé (423) :
+    hors tests marqués ``excel``, jamais de vrai Excel lancé contre un faux serveur ou un
+    fichier de test (une fabrique factice passée en ``session_factory`` reste utilisée)."""
+    if request.node.get_closest_marker("excel"):
+        return
+    from avf.services import mise_a_jour
+    monkeypatch.setattr(mise_a_jour, "excel_disponible", lambda: False)
 
 
 @pytest.fixture
@@ -71,13 +96,13 @@ def racine(tmp_path):
     wb.active["A1"] = "ID erreur"
     ws = wb.create_sheet("AUDIT ")
     ws.append(ENTETES)
-    ws.append(["2A004_1", "a", None, None, None, None])
-    ws.append(["2a004_2", "b", None, None, None, ""])
+    ws.append(["2A004_1", "a", None, None, None, None, imm("2A004", 2)])
+    ws.append(["2a004_2", "b", None, None, None, "", imm("2A004", 3)])
     wb.save(wb_2a)
     ecrire_audit(
         os.path.join(r, "Dep75", "75020", "audit_75020.xlsx"),
         [["75020_1", "z", "OK", None, "Dan"]],
-        entetes=ENTETES[:5],
+        entetes=ENTETES[:5] + ["ID imm"],
     )
     ecrire_audit(
         os.path.join(r, "Dep75", "75021", "audit_75021.xlsx"),

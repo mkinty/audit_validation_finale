@@ -63,6 +63,12 @@ complete_excel_files**. Chacun est couvert par
   toujours ouvert, sans vérifier d'abord la présence des ID dans le fichier parcouru.
   C'est nécessaire quand ce fichier est une copie locale qui peut différer du serveur.
 
+- Classeur ouvert en lecture seule parce que l'utilisateur l'a déjà ouvert **en
+  écriture dans son propre Excel** : `_classeur_ouvert_ailleurs` le retrouve dans la
+  table des objets COM en cours (ROT). Les cellules sont alors écrites dans ce classeur
+  ouvert, puis il est enregistré sans être fermé, et `AutoSaveOn` n'est pas touché.
+  Si rien n'est trouvé, le comportement d'origine s'applique : verrouillé, rien n'est écrit.
+
 ### `services/attente.py`
 
 - Un ID « non confirmé » saisi sous une autre forme (`2a004_1` pour `2A004_1`)

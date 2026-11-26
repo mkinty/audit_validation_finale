@@ -2,6 +2,7 @@
 
 from .audit import (
     AuditCommune,
+    IdAudit,
     IdErreurAudit,
     LigneAudit,
     RapportAudit,
@@ -12,6 +13,7 @@ from .colonnes import ColonnesAudit
 __all__ = [
     "AuditCommune",
     "ColonnesAudit",
+    "IdAudit",
     "IdErreurAudit",
     "LigneAudit",
     "RapportAudit",

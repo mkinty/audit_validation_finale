@@ -1,9 +1,9 @@
 """Fenêtre « Rapport d'audit » : le rapport HTML, sans quitter l'outil.
 
-    - indicateurs (communes, ID erreur, lignes validées, lignes non valides),
+    - indicateurs (communes, ID imm, lignes validées, lignes non valides),
       barre globale et motifs de non-validité ;
     - tableau des communes, triable, filtrable par texte et par état ;
-    - pour la commune sélectionnée : ses lignes auditées (ID erreur, ligne,
+    - pour la commune sélectionnée : ses lignes auditées (ID imm, ID erreur, ligne,
       statut, Audit, Date audit, Auditeur, Validation finale, motifs) ;
     - comme dans audit_ppts, le détail ne montre que les lignes non valides ;
       la case « Afficher aussi les validées » y ajoute les autres ;
@@ -22,6 +22,7 @@ from collections.abc import Callable
 import tkinter as tk
 from tkinter import ttk
 
+from sna.services.identifiants import normaliser_id
 from sna.ui.theme import Couleurs, Polices
 
 from ..models.audit import NON_VALIDES, TOUTES, AuditCommune, RapportAudit
@@ -39,6 +40,7 @@ _COLONNES = [
     ("etat", "État", 146, "w"),
 ]
 _DETAIL = [
+    ("imm", "ID imm", 118, "w"),
     ("id", "ID erreur", 92, "w"),
     ("ligne", "Ligne", 46, "e"),
     ("statut", "Statut", 112, "w"),
@@ -54,7 +56,7 @@ _FILTRES = {
     "✅ Complètes": "complete",
     "❌ En échec": "echec",
 }
-_SEPARATEUR_IID = "\x1f"   # « ID erreur » + séparateur + n° de ligne : iid unique d'une ligne
+_SEPARATEUR_IID = "\x1f"   # « ID imm » + séparateur + n° de ligne : iid unique d'une ligne
 
 
 class FenetreRapport(tk.Toplevel):
@@ -104,7 +106,7 @@ class FenetreRapport(tk.Toplevel):
         self.tuiles = {}
         for rang, (cle, libelle, accent) in enumerate([
             ("communes", "Communes auditées", Couleurs.BORDURE),
-            ("ids", "ID erreur", Couleurs.BORDURE),
+            ("ids", "ID imm", Couleurs.BORDURE),
             ("valides", "✅ Lignes validées", VERT_STATUT),
             ("non_valides", "⚠️ Lignes non valides", AMBRE_STATUT),
         ]):
@@ -287,7 +289,7 @@ class FenetreRapport(tk.Toplevel):
             if etat_voulu and p.etat(c).cle != etat_voulu:
                 continue
             if recherche and recherche not in " ".join(
-                [c.commune, f"dep{c.departement}", *(i.id_erreur for i in c.ids)]
+                [c.commune, f"dep{c.departement}", *(x for l in c.lignes for x in (l.id_imm, l.id_erreur))]
             ).lower():
                 continue
             resultat.append(c)
@@ -313,7 +315,7 @@ class FenetreRapport(tk.Toplevel):
         nb_ids = sum(c.nb_ids_non_valides for c in communes if c.lisible)
         self.lbl_aucun.config(
             text="Aucune commune ne correspond." if not communes
-            else f"{len(communes)} commune(s) affichée(s) · {p.nombre(nb_ids)} ID erreur non valide(s)"
+            else f"{len(communes)} commune(s) affichée(s) · {p.nombre(nb_ids)} ID imm non valide(s)"
         )
         self.btn_copier_affiches.config(
             text=f"📋 Copier les ID non valides affichés ({p.nombre(nb_ids)})",
@@ -352,14 +354,15 @@ class FenetreRapport(tk.Toplevel):
         if c.lisible:
             lignes.append(
                 f"{p.nombre(c.nb_lignes)} ligne(s) · {p.nombre(c.nb_lignes_valides)} validée(s) · "
-                f"{p.nombre(c.nb_lignes_non_valides)} non valide(s) — {p.nombre(c.nb_ids)} ID erreur, "
+                f"{p.nombre(c.nb_lignes_non_valides)} non valide(s) — {p.nombre(c.nb_ids)} ID imm, "
                 f"dont {p.nombre(c.nb_ids_non_valides)} non valide(s)"
             )
         self.lbl_messages.config(text="\n".join(lignes))
         for l in c.lignes_de(self.categorie()):
             el = p.etat_ligne(l)
-            self.detail.insert("", "end", iid=f"{l.id_erreur}{_SEPARATEUR_IID}{l.ligne}", tags=(el.cle,),
-                               values=(l.id_erreur, l.ligne, f"{el.icone} {el.libelle}", l.audit,
+            self.detail.insert("", "end", iid=f"{normaliser_id(l.id_imm)}{_SEPARATEUR_IID}{l.ligne}",
+                               tags=(el.cle,),
+                               values=(l.id_imm, l.id_erreur, l.ligne, f"{el.icone} {el.libelle}", l.audit,
                                        l.date_audit, l.auditeur, l.validation, l.motifs))
         ids = c.ids_non_valides
         self.btn_copier_commune.config(state="normal" if ids else "disabled",
@@ -375,7 +378,7 @@ class FenetreRapport(tk.Toplevel):
         self.clipboard_clear()
         self.clipboard_append(p.texte_ids(ids, separateur))
         self.update_idletasks()
-        self._statut(f"✓ {p.nombre(len(ids))} ID erreur copié(s) dans le presse-papiers")
+        self._statut(f"✓ {p.nombre(len(ids))} ID imm copié(s) dans le presse-papiers")
 
     def _copier_commune(self) -> None:
         c = self._commune_selectionnee()
@@ -387,7 +390,7 @@ class FenetreRapport(tk.Toplevel):
 
     def _copier_selection_detail(self) -> None:
         ids = [iid.split(_SEPARATEUR_IID)[0] for iid in self.detail.selection()]
-        self._copier(list(dict.fromkeys(ids)))
+        self._copier([i for i in dict.fromkeys(ids) if i])   # ligne sans ID imm : rien à copier
 
     def _statut(self, texte: str) -> None:
         self.lbl_statut.config(text=texte)

@@ -232,21 +232,67 @@ class _Modal(tk.Toplevel):
 
 
 class DialogueSaisie(_Modal):
-    """Saisie libre d'une liste de codes (départements ou communes)."""
+    """Saisie libre d'une liste de codes (communes ou ID erreur), collée ou chargée d'un fichier.
 
-    def __init__(self, parent, titre: str, consigne: str, exemple: str, texte: str = ""):
-        super().__init__(parent, titre)
+    ``colonnes_fichier`` : en-têtes reconnus dans un CSV / classeur (cf.
+    ``services.import_liste``) ; ``None`` masque le bouton de chargement.
+    """
+
+    def __init__(self, parent, titre: str, consigne: str, exemple: str, texte: str = "",
+                 colonnes_fichier: tuple[str, ...] | None = None):
+        super().__init__(parent, titre, 560, 440)
+        self.colonnes_fichier = colonnes_fichier
         tk.Label(self, text=consigne, bg=Couleurs.FOND, fg=Couleurs.TEXTE, font=Polices.CORPS,
-                 justify="left", wraplength=480).pack(anchor="w", padx=16, pady=(14, 2))
+                 justify="left", wraplength=520).pack(anchor="w", padx=16, pady=(14, 2))
         tk.Label(self, text=f"Exemple : {exemple}", bg=Couleurs.FOND,
                  fg=Couleurs.TEXTE_SECONDAIRE, font=Polices.PETIT).pack(anchor="w", padx=16)
         self._pied(self._valider)
+        if colonnes_fichier:
+            outils = tk.Frame(self, bg=Couleurs.FOND)
+            outils.pack(fill="x", padx=16, pady=(8, 0))
+            bouton(outils, "📄 Charger un fichier… (txt, csv, xlsx)", self._charger).pack(side="left")
+            bouton(outils, "Effacer", lambda: self._remplacer(""), "discret").pack(side="left", padx=6)
+        self.lbl_compte = tk.Label(self, text="", bg=Couleurs.FOND, fg=Couleurs.TEXTE_SECONDAIRE,
+                                   font=Polices.PETIT, anchor="w")
+        self.lbl_compte.pack(fill="x", padx=16, side="bottom")
         self.zone = tk.Text(self, bg=Couleurs.FOND_CHAMP, fg=Couleurs.BLANC, font=Polices.MONO,
-                            relief="flat", insertbackground=Couleurs.BLANC, bd=6, height=8)
+                            relief="flat", insertbackground=Couleurs.BLANC, bd=6, height=8, undo=False)
         self.zone.pack(fill="both", expand=True, padx=16, pady=(8, 0))
         self.zone.insert("1.0", texte)
         self.zone.focus_set()
         self.bind("<Control-Return>", lambda e: self._valider())
+
+    def _remplacer(self, texte: str) -> None:
+        self.zone.delete("1.0", tk.END)
+        self.zone.insert("1.0", texte)
+
+    def charger_fichier(self, chemin: str) -> bool:
+        """Remplace la saisie par les valeurs du fichier (colonne reconnue, sinon tout le fichier)."""
+        from tkinter import messagebox
+        from ..services.import_liste import ImportImpossible, lire_liste
+        try:
+            self.configure(cursor="watch")
+            self.update_idletasks()
+            liste = lire_liste(chemin, self.colonnes_fichier or ())
+        except ImportImpossible as exc:
+            messagebox.showerror("Import", str(exc), parent=self)
+            return False
+        finally:
+            self.configure(cursor="")
+        self._remplacer(liste.texte)
+        import os
+        self.lbl_compte.config(text=f"📄 {os.path.basename(chemin)} — {len(liste.valeurs)} valeur(s), "
+                                    f"{liste.origine}")
+        return True
+
+    def _charger(self) -> None:
+        from tkinter import filedialog
+        chemin = filedialog.askopenfilename(
+            parent=self, title="Charger une liste",
+            filetypes=[("Listes (txt, csv, xlsx)", "*.txt *.csv *.xlsx *.xlsm"), ("Tous les fichiers", "*.*")],
+        )
+        if chemin:
+            self.charger_fichier(chemin)
 
     def _valider(self) -> None:
         self.resultat = self.zone.get("1.0", tk.END)
@@ -261,7 +307,7 @@ class DialogueColonnes(_Modal):
     """
 
     def __init__(self, parent, colonnes: ColonnesAudit, colonne_id: str, ligne_entete: int):
-        super().__init__(parent, "Colonnes auditées", 580, 500)
+        super().__init__(parent, "Colonnes auditées", 600, 540)
         tk.Label(
             self, text="Libellés recherchés dans l'onglet « Audit » (casse et espaces ignorés).",
             bg=Couleurs.FOND, fg=Couleurs.TEXTE_SECONDAIRE, font=Polices.LABEL,
@@ -269,7 +315,8 @@ class DialogueColonnes(_Modal):
         grille = tk.Frame(self, bg=Couleurs.FOND)
         grille.pack(fill="x", padx=16)
         self.vars = {
-            "colonne_id": tk.StringVar(value=colonne_id),
+            "colonne_id": tk.StringVar(value=colonne_id or colonnes.id_imm),
+            "id_erreur": tk.StringVar(value=colonnes.id_erreur),
             "audit": tk.StringVar(value=colonnes.audit),
             "date_audit": tk.StringVar(value=colonnes.date_audit),
             "auditeur": tk.StringVar(value=colonnes.auditeur),
@@ -279,7 +326,8 @@ class DialogueColonnes(_Modal):
             "ligne_entete": tk.StringVar(value=str(ligne_entete)),
         }
         libelles = [
-            ("colonne_id", "ID erreur"), ("audit", "Audit"), ("date_audit", "Date audit"),
+            ("colonne_id", "ID imm (identifiant)"), ("id_erreur", "ID erreur"),
+            ("audit", "Audit"), ("date_audit", "Date audit"),
             ("auditeur", "Auditeur"), ("validation", "Validation finale"), None,
             ("valeurs_audit", "Audit accepté"), ("valeurs_validation", "Validation finale acceptée"),
             None, ("ligne_entete", "Ligne d'en-tête"),
@@ -299,8 +347,9 @@ class DialogueColonnes(_Modal):
                  "une date (même saisie en texte : 12/03/2026, 2026-03-12, 12 mars 2026…), Auditeur "
                  "est renseigné et Validation finale est l'une des valeurs acceptées. Valeurs "
                  "séparées par des virgules ; casse et espaces ignorés.\n\n"
-                 "Les cinq colonnes sont obligatoires : une colonne absente fait échouer l'audit "
-                 "de la commune. La colonne ID erreur et la ligne d'en-tête servent aussi à la mise à jour.",
+                 "Toutes ces colonnes sont obligatoires : une colonne absente fait échouer l'audit de la "
+                 "commune. L'ID imm, unique par ligne, est l'identifiant copié et mis à jour ; la ligne "
+                 "d'en-tête sert aussi à la mise à jour.",
             bg=Couleurs.FOND, fg=Couleurs.TEXTE_SECONDAIRE, font=Polices.PETIT, justify="left",
             wraplength=540,
         ).pack(anchor="w", padx=16, pady=(10, 0))
@@ -312,6 +361,7 @@ class DialogueColonnes(_Modal):
             ligne = max(int(valeurs.pop("ligne_entete")), 1)
         except ValueError:
             ligne = 1
-        colonne_id = valeurs.pop("colonne_id") or "ID erreur"
+        colonne_id = valeurs.pop("colonne_id") or "ID imm"
+        valeurs["id_imm"] = colonne_id          # identifiant des mises à jour (règles comprises)
         self.resultat = (ColonnesAudit.from_dict(valeurs), colonne_id, ligne)
         self.destroy()

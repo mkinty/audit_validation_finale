@@ -6,7 +6,7 @@ from avf.models.audit import LigneAudit
 from avf.models.colonnes import ColonnesAudit, parser_valeurs
 from avf.services.controle import controler_ligne, est_date
 
-VALIDE = dict(audit="OK", date_audit="12/03/2026", auditeur="Alice", validation="OK")
+VALIDE = dict(audit="OK", date_audit="12/03/2026", auditeur="Alice", validation="OK", id_imm="ID-130010000002")
 
 
 def _criteres(colonnes=None, **valeurs):
@@ -60,13 +60,18 @@ def test_auditeur_et_date_obligatoires():
 
 
 def test_tous_les_criteres_et_messages():
-    ligne = LigneAudit(5, "X", audit="Fait", date_audit="hier", auditeur="", validation="Validé")
+    ligne = LigneAudit(5, "X", audit="Fait", date_audit="hier", auditeur="", validation="Validé", id_imm=" ")
     assert [a.message for a in controler_ligne(ligne, ColonnesAudit())] == [
         "Audit « Fait » ≠ OK / KO",
         "Date audit « hier » n'est pas une date",
         "Auditeur vide",
+        "ID imm vide (ligne non ciblable par la mise à jour)",
         "Validation finale « Validé » ≠ OK",
     ]
+
+
+def test_ligne_sans_id_imm_non_valide():
+    assert _criteres(id_imm="") == ["id_imm"]
 
 
 def test_valeurs_acceptees_reglables():

@@ -4,6 +4,8 @@ from avf.models.audit import (
 )
 from avf.services.audit import auditer_commune, auditer_communes, regrouper_par_id
 
+from .conftest import ecrire_audit, imm
+
 TOUTES = ["13001", "13002", "13003", "2A004", "75020", "75021", "99999"]
 
 
@@ -22,12 +24,15 @@ def test_lignes_validees_et_non_valides(racine):
     assert not c.complete
 
 
-def test_ids_valides_si_toutes_leurs_lignes_le_sont(racine):
+def test_identifiant_de_ligne_est_l_id_imm(racine):
+    """13001_5 couvre deux logements (deux ID imm) : deux identifiants distincts, plus de doublon."""
     c = auditer_commune("13001", racine)
-    assert c.nb_ids == 5 and c.nb_ids_valides == 1 and c.nb_ids_non_valides == 4
-    assert c.ids_non_valides == ["13001_2", "13001_3", "13001_4", "13001_5"]
-    assert c.ids_de(VALIDEES) == ["13001_1"]
-    assert c.nb_doublons == 1
+    assert c.nb_ids == 6 and c.nb_ids_valides == 1 and c.nb_ids_non_valides == 5
+    assert c.ids_non_valides == [imm("13001", n) for n in (3, 4, 5, 6, 7)]
+    assert c.ids_de(VALIDEES) == [imm("13001", 2)]
+    assert c.nb_doublons == 0
+    deux = [i for i in c.ids if i.ids_erreur == ["13001_5"]]
+    assert [i.identifiant for i in deux] == [imm("13001", 6), imm("13001", 7)]
 
 
 def test_motifs_par_critere(racine):
@@ -36,15 +41,32 @@ def test_motifs_par_critere(racine):
     assert _motifs(c, 4) == "Date audit vide · Validation finale vide"   # KO accepté, VF « ␣␣␣ » vide
     assert _motifs(c, 5) == "Validation finale « Validé » ≠ OK"
     assert _motifs(c, 2) == ""
-    assert c.par_critere() == {"audit": 3, "date_audit": 4, "auditeur": 3, "validation": 4}
+    assert c.par_critere() == {"audit": 3, "date_audit": 4, "auditeur": 3, "validation": 4, "id_imm": 0}
 
 
-def test_doublon_reference_premiere_ligne_non_valide(racine):
+def test_id_imm_en_double_et_lignes_sans_id_imm(tmp_path):
+    """Un ID imm devrait être unique : un doublon (erreur de saisie) est regroupé et signalé ;
+    une ligne sans ID imm est non valide et jamais copiée."""
+    racine = str(tmp_path)
+    ecrire_audit(f"{racine}/Dep13/13001/audit_13001.xlsx", [
+        ["13001_1", "a", "OK", "01/01/2026", "Al", "OK", "ID-130010000009"],
+        ["13001_2", "b", None, None, None, None, "ID-130010000009"],       # doublon d'ID imm
+        ["13001_3", "c", "OK", "01/01/2026", "Al", "OK", None],             # sans ID imm
+        [None, "d", None, None, None, None, "ID-130010000011"],              # ID imm sans ID erreur
+        ["13001_4", "e", "OK", "01/01/2026", "Al", "OK", "ID-3803300000FS"],  # ID imm d'une autre commune
+    ])
     c = auditer_commune("13001", racine)
-    doublon = next(i for i in c.ids if i.id_erreur == "13001_5")
-    assert doublon.doublon and not doublon.valide
-    assert doublon.reference.ligne == 6
-    assert [l.ligne for l in doublon.lignes_non_valides] == [6, 7]
+    doublon = next(i for i in c.ids if i.identifiant == "ID-130010000009")
+    assert doublon.doublon and not doublon.valide and doublon.reference.ligne == 3
+    assert doublon.ids_erreur == ["13001_1", "13001_2"]
+    assert c.nb_doublons == 1
+    assert c.nb_lignes == 5 and c.nb_ids == 3                 # la ligne sans ID imm n'est pas un identifiant
+    assert "ID-130010000009" in c.ids_non_valides and "" not in c.ids_non_valides
+    assert next(l for l in c.lignes if l.ligne == 4).motifs == "ID imm vide (ligne non ciblable par la mise à jour)"
+    avertissements = " | ".join(c.avertissements)
+    assert "1 ID imm en double" in avertissements and "ID-130010000009" in avertissements
+    assert "1 ligne(s) sans ID imm" in avertissements and "ligne(s) 4" in avertissements
+    assert "1 ID imm au code d'une autre commune" in avertissements and "ID-3803300000FS" in avertissements
 
 
 def test_commune_complete_date_texte_et_casse(racine):
@@ -56,7 +78,8 @@ def test_commune_complete_date_texte_et_casse(racine):
 def test_ids_normalises_comme_le_moteur(racine):
     c = auditer_commune("2a004", racine)
     assert c.commune == "2A004" and c.departement == "2A"
-    assert c.ids_non_valides == ["2A004_1", "2A004_2"]
+    assert c.ids_non_valides == [imm("2A004", 2), imm("2A004", 3)]
+    assert [l.id_erreur for l in c.lignes] == ["2A004_1", "2a004_2"]
 
 
 def test_sans_fichier(racine):
@@ -95,22 +118,22 @@ def test_auditer_communes_rapport(racine):
     assert progression[0] == (0, 7) and progression[-1] == (7, 7)
     assert set(etapes) >= {"13001", "2A004"}
     assert (rapport.nb_lignes, rapport.nb_lignes_valides, rapport.nb_lignes_non_valides) == (11, 3, 8)
-    assert (rapport.nb_ids, rapport.nb_ids_valides, rapport.nb_ids_non_valides) == (10, 3, 7)
+    assert (rapport.nb_ids, rapport.nb_ids_valides, rapport.nb_ids_non_valides) == (11, 3, 8)
     assert rapport.taux == 3 / 11
     assert [c.commune for c in rapport.en_echec] == ["13003", "75020", "99999"]
     assert [c.commune for c in rapport.communes_completes] == ["13002"]
     assert [c.commune for c in rapport.communes_a_corriger] == ["13001", "2A004", "75021"]
     assert rapport.ids_non_valides_par_commune() == {
-        "13001": ["13001_2", "13001_3", "13001_4", "13001_5"],
-        "2A004": ["2A004_1", "2A004_2"],
-        "75021": ["75021_1"],
+        "13001": [imm("13001", n) for n in (3, 4, 5, 6, 7)],
+        "2A004": [imm("2A004", 2), imm("2A004", 3)],
+        "75021": [imm("75021", 2)],
     }
-    assert len(rapport.ids_de(NON_VALIDES)) == 7
-    assert rapport.ids_de(VALIDEES) == ["13001_1", "13002_1", "13002_2"]
-    assert rapport.par_critere() == {"audit": 6, "date_audit": 7, "auditeur": 6, "validation": 7}
+    assert len(rapport.ids_de(NON_VALIDES)) == 8
+    assert rapport.ids_de(VALIDEES) == [imm("13001", 2), imm("13002", 2), imm("13002", 3)]
+    assert rapport.par_critere() == {"audit": 6, "date_audit": 7, "auditeur": 6, "validation": 7, "id_imm": 0}
     deps = rapport.par_departement()
     assert list(deps) == ["13", "2A", "75", "99"]
-    assert deps["13"] == {"communes": 3, "ids": 7, "lignes": 8, "valides": 3, "non_valides": 5, "erreurs": 1}
+    assert deps["13"] == {"communes": 3, "ids": 8, "lignes": 8, "valides": 3, "non_valides": 5, "erreurs": 1}
 
 
 def test_arret_demande(racine):
@@ -119,13 +142,14 @@ def test_arret_demande(racine):
     assert [c.commune for c in rapport.communes] == ["13001"]
 
 
-def test_regrouper_par_id_ignore_les_vides():
+def test_regrouper_par_id_imm_ignore_les_lignes_sans_identifiant():
     groupes = regrouper_par_id([
-        LigneAudit(2, " 1_1 "), LigneAudit(3, ""),
-        LigneAudit(4, "1_1", anomalies=[Anomalie("audit", "Audit vide")]),
+        LigneAudit(2, " 1_1 ", id_imm=" id-130010000002 "), LigneAudit(3, "", id_imm=""),
+        LigneAudit(4, "1_1", id_imm="ID-130010000004", anomalies=[Anomalie("audit", "Audit vide")]),
+        LigneAudit(5, "1_1", id_imm="ID-130010000002"),
     ])
-    assert [(g.id_erreur, len(g.lignes)) for g in groupes] == [("1_1", 2)]
-    assert not groupes[0].valide
+    assert [(g.identifiant, len(g.lignes)) for g in groupes] == [("ID-130010000002", 2), ("ID-130010000004", 1)]
+    assert groupes[0].ids_erreur == ["1_1"] and not groupes[1].valide
 
 
 def test_rapport_remplacer_garde_ordre():

@@ -31,6 +31,8 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 import json
 import re
+import threading
+import time
 import urllib.error
 import urllib.request
 from urllib.parse import quote, unquote, urlsplit
@@ -43,6 +45,26 @@ _SITE = re.compile(r"^/(sites|teams|personal|portals)/[^/]+", re.I)
 
 class AuthentificationRequise(PermissionError):
     """La session SharePoint est absente, expirée, ou n'ouvre pas ce dossier."""
+
+
+class TelechargementInterdit(PermissionError):
+    """Accès conditionnel de l'organisation : téléchargement interdit depuis cet appareil.
+
+    SharePoint laisse lister les dossiers mais refuse le contenu des fichiers
+    (« vous ne pouvez pas télécharger ces ressources à partir de cet appareil »,
+    code ``conditionalAccessPolicyEnforced``) — typiquement sur un poste non géré
+    (ni joint ni enregistré dans l'annuaire de l'organisation). C'est une règle de
+    sécurité de l'organisation : l'outil la signale, il ne la contourne pas.
+    """
+
+    EXPLICATION = (
+        "Votre organisation interdit le téléchargement des fichiers SharePoint depuis cet "
+        "appareil (accès conditionnel : poste non géré). La liste des dossiers reste lisible, "
+        "mais pas le contenu des fichiers audit.\n\n"
+        "• Utilisez l'outil sur un poste de l'entreprise (géré), ou\n"
+        "• demandez à votre service informatique d'enregistrer ce poste ou d'autoriser cet usage, ou\n"
+        "• auditez une copie locale des fichiers (source « Dossier local »)."
+    )
 
 
 class VersionModifiee(RuntimeError):
@@ -72,6 +94,8 @@ class ClientSharePoint:
         self.cookies = dict(cookies)
         self.delai_s = delai_s
         self.base = (base or f"https://{self.hote}").rstrip("/")   # remplaçable en test
+        self._arborescences: dict[str, tuple[float, dict[str, list[dict]]]] = {}
+        self._verrou_arbo = threading.Lock()
 
     # ── Requêtes ──────────────────────────────────────────────────
     def _requete(self, chemin: str, binaire: bool = False) -> bytes:
@@ -92,7 +116,12 @@ class ClientSharePoint:
                     raise AuthentificationRequise("session SharePoint absente ou expirée")
                 return reponse.read(), dict(reponse.headers.items())
         except urllib.error.HTTPError as exc:
-            message = _message_erreur(exc)
+            corps = _corps(exc)
+            message = _message_erreur(corps, exc.reason)
+            if exc.code == 403 and "conditionalaccesspolicyenforced" in corps.lower():
+                raise TelechargementInterdit(
+                    f"téléchargement interdit depuis cet appareil par les stratégies de l'organisation "
+                    f"({message})") from None
             if exc.code == 412:
                 raise VersionModifiee("fichier enregistré par quelqu'un d'autre depuis sa lecture") from None
             if exc.code == 423 or _est_verrou(message):
@@ -201,6 +230,31 @@ class ClientSharePoint:
                      "Content-Type": "application/octet-stream"},
         )
 
+    def arborescence(self, racine: str, forcer: bool = False, age_max_s: float = 600,
+                     paralleles: int = 8) -> dict[str, list[dict]]:
+        """``{CODE COMMUNE: [fichiers]}`` de ``<racine>/Dep*/<commune>``, gardé en mémoire.
+
+        Scan rapide : une requête pour la liste des ``Dep<XX>``, puis une par
+        ``Dep<XX>`` (ses communes **et** leurs fichiers ensemble), en parallèle —
+        quelques requêtes pour des centaines de communes. Le résultat sert ensuite à
+        vérifier n'importe quel nombre de communes ou d'ID collés **sans requête**.
+        Refait après ``age_max_s`` secondes, ou si ``forcer``.
+        """
+        with self._verrou_arbo:
+            memo = self._arborescences.get(racine)
+            if memo and not forcer and time.monotonic() - memo[0] < age_max_s:
+                return memo[1]
+        departements = [d for d in self.dossiers(racine) if d.lower().startswith(PREFIXE_DEP.lower())]
+        with ThreadPoolExecutor(max_workers=max(1, min(paralleles, len(departements) or 1))) as pool:
+            contenus = list(pool.map(lambda d: self.dossiers_et_fichiers(f"{racine}/{d}"), departements))
+        arbo: dict[str, list[dict]] = {}
+        for contenu in contenus:
+            for code, fichiers in contenu.items():
+                arbo[code.upper()] = fichiers
+        with self._verrou_arbo:
+            self._arborescences[racine] = (time.monotonic(), arbo)
+        return arbo
+
     def url(self, chemin_serveur: str) -> str:
         return f"https://{self.hote}{quote(chemin_serveur, safe='/')}"
 
@@ -222,20 +276,12 @@ def copies_de_conflit(fichiers: list[dict]) -> list[tuple[str, str]]:
     return resultat
 
 
-def lister_communes(client: ClientSharePoint, racine: str, paralleles: int = 8):
-    """``[(code, département, a_fichier)]`` de toutes les communes ``<racine>/Dep*/<commune>``.
-
-    Une requête par dossier ``Dep<XX>`` (sous-dossiers et leurs fichiers ensemble),
-    en parallèle.
-    """
-    departements = [d for d in client.dossiers(racine) if d.lower().startswith(PREFIXE_DEP.lower())]
-    with ThreadPoolExecutor(max_workers=max(1, min(paralleles, len(departements) or 1))) as pool:
-        contenus = list(pool.map(lambda d: client.dossiers_et_fichiers(f"{racine}/{d}"), departements))
-    communes = []
-    for contenu in contenus:
-        for code, fichiers in contenu.items():
-            communes.append((code.upper(), code[:2].upper(), fichier_audit(fichiers) is not None))
-    return sorted(set(communes))
+def lister_communes(client: ClientSharePoint, racine: str, forcer: bool = True):
+    """``[(code, département, a_fichier)]`` de toutes les communes ``<racine>/Dep*/<commune>``."""
+    return sorted(
+        (code, code[:2], fichier_audit(fichiers) is not None)
+        for code, fichiers in client.arborescence(racine, forcer=forcer).items()
+    )
 
 
 def _est_verrou(message: str) -> bool:
@@ -254,9 +300,21 @@ def _date(horodatage: str | None) -> str:
         return "date inconnue"
 
 
-def _message_erreur(exc: urllib.error.HTTPError) -> str:
+def _corps(exc: urllib.error.HTTPError) -> str:
     try:
-        donnees = json.loads(exc.read().decode("utf-8"))
-        return donnees.get("odata.error", {}).get("message", {}).get("value") or str(donnees)[:200]
+        return exc.read().decode("utf-8", errors="replace")
     except Exception:  # noqa: BLE001
-        return exc.reason or ""
+        return ""
+
+
+def _message_erreur(corps: str, raison: str = "") -> str:
+    """Message d'une réponse d'erreur SharePoint (formats « odata.error » et « error »)."""
+    try:
+        donnees = json.loads(corps)
+    except ValueError:
+        return raison or corps[:200]
+    message = donnees.get("odata.error", {}).get("message", {})
+    if isinstance(message, dict) and message.get("value"):
+        return message["value"]
+    erreur = donnees.get("error", {})
+    return erreur.get("message") or str(donnees)[:200]

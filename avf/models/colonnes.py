@@ -28,6 +28,8 @@ class ColonnesAudit:
 
     validation: str = "Validation finale"
     audit: str = "Audit"
+    id_erreur: str = "ID erreur"
+    id_imm: str = "ID imm"     # identifiant des mises à jour : unique par ligne (ID erreur ne l'est pas)
     date_audit: str = "Date audit"
     auditeur: str = "Auditeur"
     valeurs_validation: tuple[str, ...] = VALEURS_VALIDATION_DEFAUT
@@ -46,6 +48,8 @@ class ColonnesAudit:
             "audit": self.audit,
             "date_audit": self.date_audit,
             "auditeur": self.auditeur,
+            "id_erreur": self.id_erreur,
+            "id_imm": self.id_imm,
             "valeurs_validation": list(self.valeurs_validation),
             "valeurs_audit": list(self.valeurs_audit),
         }
@@ -63,6 +67,8 @@ class ColonnesAudit:
             audit=lire("audit"),
             date_audit=lire("date_audit"),
             auditeur=lire("auditeur"),
+            id_erreur=lire("id_erreur"),
+            id_imm=lire("id_imm"),
             valeurs_validation=parser_valeurs(data.get("valeurs_validation")) or VALEURS_VALIDATION_DEFAUT,
             valeurs_audit=parser_valeurs(data.get("valeurs_audit")) or VALEURS_AUDIT_DEFAUT,
         )

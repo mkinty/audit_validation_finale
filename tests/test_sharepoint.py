@@ -17,6 +17,8 @@ from sna.models.regles import ReglesConfig
 from sna.services.excel import appliquer_regles
 from sna.services.onedrive import url_sharepoint
 
+from .conftest import imm
+
 HOTE = "contoso.sharepoint.com"
 DOSSIER = "/sites/SNA/Shared Documents/Audit SNA"
 URL = "https://contoso.sharepoint.com/sites/SNA/Shared%20Documents/Audit%20SNA"
@@ -219,7 +221,7 @@ def test_audit_via_excel_lit_la_version_serveur(racine, serveur_divergent):
     assert session.ouvertures == [URL + "/Dep13/13001/audit_13001.xlsx",
                                   URL + "/Dep13/13002/audit_13002.xlsx"]
     c = rapport.commune("13002")
-    assert c.ids_non_valides == ["13002_1"]                    # version serveur auditée
+    assert c.ids_non_valides == [imm("13002", 2)]              # version serveur auditée
     assert c.chemin == URL + "/Dep13/13002/audit_13002.xlsx"   # adresse SharePoint affichée
     assert auditer_communes(["13002"], racine).commune("13002").complete   # la copie locale, elle, l'est
 
@@ -252,7 +254,8 @@ def test_mise_a_jour_sharepoint_toujours_via_excel(racine):
     session = _SessionServeur("", racine, URL)
     groupes = groupes_depuis_rapport(auditer_communes(["13001"], racine))
     bilan = mettre_a_jour(groupes, ReglesConfig.defaut(), racine, via_excel=False,
-                          session_factory=lambda: session, source=SourceAudit(WEBDAV, racine, URL))
+                          session_factory=lambda: session, source=SourceAudit(WEBDAV, racine, URL),
+                          colonne_id="ID imm")
     assert bilan.via_excel and session.ouvertures
 
 
@@ -303,7 +306,7 @@ def test_audit_par_adresse_lit_le_serveur(racine, serveur_divergent):
     with sp.acces_pour(source, session_factory=lambda: session) as acces:
         rapport = auditer_communes(["13001", "13002"], source.racine, source=source, acces=acces)
     assert session.ouvertures == [URL + "/Dep13/13001/audit_13001.xlsx", URL + "/Dep13/13002/audit_13002.xlsx"]
-    assert rapport.commune("13002").ids_non_valides == ["13002_1"]       # version serveur
+    assert rapport.commune("13002").ids_non_valides == [imm("13002", 2)]   # version serveur
     assert rapport.commune("13002").chemin == URL + "/Dep13/13002/audit_13002.xlsx"
 
 
@@ -325,7 +328,7 @@ def test_audit_par_ids_en_mode_adresse(racine, serveur_divergent):
     session = _SessionServeur(serveur_divergent, racine, URL)
     with sp.acces_pour(source, lambda: session) as acces:
         r = auditer_communes(["13002"], URL, source=source, acces=acces, ids={"13002": ["13002_1"]})
-    assert r.commune("13002").ids_non_valides == ["13002_1"] and r.nb_lignes == 1
+    assert r.commune("13002").ids_non_valides == [imm("13002", 2)] and r.nb_lignes == 1
 
 
 def test_mise_a_jour_par_adresse(racine):

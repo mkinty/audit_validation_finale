@@ -24,8 +24,12 @@ from enum import Enum
 from .colonnes import ColonnesAudit
 from .source import SourceAudit
 
-# Critères contrôlés, dans l'ordre d'affichage.
-CRITERES = ("audit", "date_audit", "auditeur", "validation")
+# Critères contrôlés, dans l'ordre d'affichage. « id_imm » : ligne sans ID imm, donc
+# impossible à cibler par la mise à jour (l'ID imm est son identifiant).
+CRITERES = ("audit", "date_audit", "auditeur", "validation", "id_imm")
+
+# Ce que l'utilisateur peut saisir pour restreindre l'audit.
+PAR_ID_ERREUR, PAR_ID_IMM = "id_erreur", "id_imm"
 
 # Ce que l'on affiche ou copie : les lignes non valides, les validées, ou toutes.
 NON_VALIDES, VALIDEES, TOUTES = "non_valides", "validees", "toutes"
@@ -55,11 +59,12 @@ class Anomalie:
 
 @dataclass
 class LigneAudit:
-    """Une ligne de l'onglet « Audit » portant un ID erreur."""
+    """Une ligne de l'onglet « Audit » portant un ID erreur ou un ID imm."""
 
     ligne: int
     id_erreur: str
     validation: str = ""
+    id_imm: str = ""
     audit: str = ""
     date_audit: str = ""
     auditeur: str = ""
@@ -79,11 +84,23 @@ class LigneAudit:
 
 
 @dataclass
-class IdErreurAudit:
-    """Un ID erreur et la ou les lignes qui le portent."""
+class IdAudit:
+    """Un **ID imm** — l'identifiant d'une ligne, celui que la mise à jour cible —
+    et la ou les lignes qui le portent (plusieurs seulement en cas de doublon,
+    signalé : un ID imm devrait être unique).
 
-    id_erreur: str
+    Un même **ID erreur**, lui, peut légitimement couvrir plusieurs ID imm
+    (plusieurs logements) : regrouper par ID erreur faisait modifier toutes ces
+    lignes ensemble, même celles déjà validées.
+    """
+
+    identifiant: str
     lignes: list[LigneAudit] = field(default_factory=list)
+
+    @property
+    def ids_erreur(self) -> list[str]:
+        """ID erreur portés par les lignes de cet ID imm (sans doublon)."""
+        return list(dict.fromkeys(l.id_erreur.strip() for l in self.lignes if l.id_erreur.strip()))
 
     @property
     def valide(self) -> bool:
@@ -107,6 +124,9 @@ class IdErreurAudit:
         return categorie == TOUTES or (self.valide if categorie == VALIDEES else not self.valide)
 
 
+IdErreurAudit = IdAudit   # ancien nom
+
+
 @dataclass
 class AuditCommune:
     """Résultat de l'audit d'une commune (un fichier audit)."""
@@ -116,19 +136,20 @@ class AuditCommune:
     statut: StatutAudit = StatutAudit.OK
     chemin: str = ""
     message: str = ""
-    ids: list[IdErreurAudit] = field(default_factory=list)
+    ids: list[IdAudit] = field(default_factory=list)
     avertissements: list[str] = field(default_factory=list)
     nb_lignes_lues: int = 0
     duree: float = 0.0
-    # Audit restreint à des ID erreur saisis : ceux demandés pour la commune
-    # (``None`` : toute la commune), et ceux absents du fichier.
+    # Audit restreint à des ID saisis (ID erreur ou ID imm, cf. ``type_ids``) : ceux
+    # demandés pour la commune (``None`` : toute la commune), et ceux absents du fichier.
     ids_demandes: list[str] | None = None
     ids_introuvables: list[str] = field(default_factory=list)
+    type_ids: str = PAR_ID_ERREUR
 
     # ── Lignes ────────────────────────────────────────────────────
     @property
     def lignes(self) -> list[LigneAudit]:
-        """Toutes les lignes portant un ID erreur, dans l'ordre du fichier."""
+        """Toutes les lignes portant un ID erreur ou un ID imm, dans l'ordre du fichier."""
         return sorted((l for i in self.ids for l in i.lignes), key=lambda l: l.ligne)
 
     def lignes_de(self, categorie: str = NON_VALIDES) -> list[LigneAudit]:
@@ -146,14 +167,19 @@ class AuditCommune:
     def nb_lignes_non_valides(self) -> int:
         return self.nb_lignes - self.nb_lignes_valides
 
-    # ── ID erreur ─────────────────────────────────────────────────
+    # ── ID imm (identifiants des mises à jour) ────────────────────
+    @property
+    def identifiables(self) -> list[IdAudit]:
+        """Groupes d'ID imm (les lignes sans ID imm ne sont pas ciblables)."""
+        return [i for i in self.ids if i.identifiant]
+
     @property
     def nb_ids(self) -> int:
-        return len(self.ids)
+        return len(self.identifiables)
 
     @property
     def nb_ids_valides(self) -> int:
-        return sum(1 for i in self.ids if i.valide)
+        return sum(1 for i in self.identifiables if i.valide)
 
     @property
     def nb_ids_non_valides(self) -> int:
@@ -161,11 +187,13 @@ class AuditCommune:
 
     @property
     def nb_doublons(self) -> int:
-        return sum(1 for i in self.ids if i.doublon)
+        """ID imm présents sur plusieurs lignes (anomalie : un ID imm devrait être unique)."""
+        return sum(1 for i in self.identifiables if i.doublon)
 
     def ids_de(self, categorie: str = NON_VALIDES) -> list[str]:
-        """ID erreur de la catégorie (``NON_VALIDES`` : au moins une ligne non valide)."""
-        return [i.id_erreur for i in self.ids if i.dans(categorie)] if self.lisible else []
+        """ID imm de la catégorie (``NON_VALIDES`` : au moins une ligne non valide) — à copier
+        et à mettre à jour."""
+        return [i.identifiant for i in self.identifiables if i.dans(categorie)] if self.lisible else []
 
     @property
     def ids_non_valides(self) -> list[str]:
@@ -211,15 +239,20 @@ class RapportAudit:
     # ── Périmètre : communes entières, ou ID erreur saisis ────────
     @property
     def par_ids(self) -> bool:
-        """Vrai si l'audit est restreint à des ID erreur saisis."""
+        """Vrai si l'audit est restreint à des ID saisis (ID erreur ou ID imm)."""
         return any(c.ids_demandes is not None for c in self.communes)
+
+    @property
+    def type_ids(self) -> str:
+        """``PAR_ID_ERREUR`` ou ``PAR_ID_IMM`` : nature des ID saisis."""
+        return next((c.type_ids for c in self.communes if c.ids_demandes is not None), PAR_ID_ERREUR)
 
     @property
     def nb_ids_demandes(self) -> int:
         return sum(len(c.ids_demandes or []) for c in self.communes)
 
     def ids_introuvables(self) -> list[str]:
-        """ID erreur saisis absents de leur fichier (ou dont la commune n'a pas pu être lue)."""
+        """ID saisis absents de leur fichier (ou dont la commune n'a pas pu être lue)."""
         return [i for c in self.communes for i in (c.ids_introuvables if c.lisible else c.ids_demandes or [])]
 
     @property

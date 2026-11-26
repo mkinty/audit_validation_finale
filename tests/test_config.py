@@ -18,6 +18,7 @@ def test_aller_retour(tmp_path):
                    colonnes=ColonnesAudit(validation="VF"), date_du_jour=False,
                    ecrire_via_excel=False, reauditer=False, dossier_export="D:/r")
     p.regles.regles[2].action.valeur = "Moi"
+    p.regles.colonne_id = p.colonnes.id_imm      # identifiant des mises à jour : l'ID imm
     assert enregistrer(p, fichier)
     relu = charger(fichier)
     assert relu.to_dict() == p.to_dict()
@@ -36,8 +37,22 @@ def test_cles_manquantes_et_regles_corrompues(tmp_path):
                                    "colonnes": {"validation": "  "}}), encoding="utf-8")
     p = charger(str(fichier))
     assert p.racine == "X"
-    assert p.regles.to_dict() == ReglesConfig.defaut().to_dict()
+    assert p.regles.to_dict() == {**ReglesConfig.defaut().to_dict(), "colonne_id": "ID imm"}
     assert p.colonnes.validation == "Validation finale"
+
+
+def test_migration_identifiant_id_imm(tmp_path):
+    """Ancienne configuration : les règles identifiaient les lignes par l'ID erreur (colonne
+    éventuellement renommée). Désormais : ID imm ; le nom de la colonne ID erreur est conservé."""
+    fichier = tmp_path / "cfg.json"
+    fichier.write_text(json.dumps({"regles": {"colonne_id": "Identifiant erreur", "regles": []}}),
+                       encoding="utf-8")
+    p = charger(str(fichier))
+    assert p.regles.colonne_id == "ID imm" and p.colonnes.id_erreur == "Identifiant erreur"
+    fichier.write_text(json.dumps({"colonnes": {"id_imm": "N° imm", "id_erreur": "Err"},
+                                   "type_ids": "id_imm"}), encoding="utf-8")
+    p = charger(str(fichier))
+    assert (p.regles.colonne_id, p.colonnes.id_erreur, p.type_ids) == ("N° imm", "Err", "id_imm")
 
 
 def test_enregistrement_impossible(tmp_path):

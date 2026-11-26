@@ -504,6 +504,7 @@ class AccesApi(AccesFichiers):
         self._compteur = 0
         self._fichiers: dict[str, list[dict]] = {}
         self._verrou = threading.Lock()
+        self.interdit = ""          # accès conditionnel : téléchargement refusé une fois → arrêt
 
     def __enter__(self) -> "AccesApi":
         self._dossier = tempfile.mkdtemp(prefix="avf_sharepoint_")
@@ -540,7 +541,8 @@ class AccesApi(AccesFichiers):
                 for nom, date in rest.copies_de_conflit(self._liste(commune))]
 
     def existe(self, commune: str) -> bool:
-        return self.client.dossier_existe(self._dossier_commune(commune))
+        """Par l'arborescence gardée en mémoire (un scan, puis plus aucune requête)."""
+        return commune.strip().upper() in self.client.arborescence(self.racine)
 
     def adresse(self, chemin: str) -> str:
         return chemin
@@ -548,14 +550,20 @@ class AccesApi(AccesFichiers):
     def lisible(self, chemin: str) -> str:
         if not self._dossier:
             raise RuntimeError("AccesApi s'utilise dans un bloc « with »")
+        if self.interdit:          # inutile d'interroger le serveur pour chaque commune
+            raise rest.TelechargementInterdit(self.interdit)
         with self._verrou:
             self._compteur += 1
             nom = chemin.rsplit("/", 1)[-1].replace("%20", " ")
             destination = os.path.join(self._dossier, f"{self._compteur:05d}_{nom}")
-        return self.client.telecharger(rest.chemin_serveur(chemin), destination)
+        try:
+            return self.client.telecharger(rest.chemin_serveur(chemin), destination)
+        except rest.TelechargementInterdit as exc:
+            self.interdit = str(exc)
+            raise
 
-    def lister_communes(self) -> list[tuple[str, str, bool]]:
-        return rest.lister_communes(self.client, self.racine)
+    def lister_communes(self, forcer: bool = True) -> list[tuple[str, str, bool]]:
+        return rest.lister_communes(self.client, self.racine, forcer=forcer)
 
 
 class SessionApi:
@@ -582,6 +590,7 @@ class SessionApi:
 
     def __init__(self, client: rest.ClientSharePoint):
         self.client = client
+        self.interdit = ""
         self._dossier = ""
         self._compteur = 0
         self._verrou = threading.Lock()
@@ -612,12 +621,20 @@ class SessionApi:
         if etat["CheckOutType"] != 2:                  # 2 = non extrait
             from sna.services.excel import BilanFichier
             bilan = BilanFichier(comptes={r.code: 0 for r in config.actives})
-            bilan.verrouille = etat["CheckedOutBy"] or "un autre utilisateur (fichier extrait)"
-            dire(f"⚠ fichier extrait par {bilan.verrouille} — rien écrit")
+            qui = etat["CheckedOutBy"] or "un autre utilisateur"
+            bilan.verrouille = (f"{qui} — fichier EXTRAIT (check-out) : personne d'autre ne peut le modifier, "
+                                "même en co-édition, tant qu'il n'est pas réarchivé (check-in) dans SharePoint")
+            dire(f"⚠ fichier extrait par {qui} — rien écrit")
             return bilan
         for essai in range(1, self.TENTATIVES + 1):
             local = self._copie(fichier)
-            etag = self.client.telecharger_version(chemin, local)
+            if self.interdit:
+                raise rest.TelechargementInterdit(self.interdit)
+            try:
+                etag = self.client.telecharger_version(chemin, local)
+            except rest.TelechargementInterdit as exc:
+                self.interdit = str(exc)
+                raise
             dire(f"version serveur téléchargée (API SharePoint, essai {essai})")
             bilan = appliquer_regles(local, config, ids, on_etape=on_etape)
             bilan.ouverture = "API SharePoint (session du navigateur)"

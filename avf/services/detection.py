@@ -93,7 +93,7 @@ def verifier_communes(racine: str, codes: Iterable[str],
     étant les deux premiers caractères du code (cf. complete_excel_files).
     """
     resultat = VerificationCommunes()
-    for code in codes:
+    for code in dict.fromkeys(normaliser_commune(c) for c in codes if str(c).strip()):   # sans doublon
         dossier = dossier_commune(racine, code)
         if existe(dossier):
             resultat.trouvees.append(CommuneDetectee(
@@ -123,7 +123,32 @@ class SaisieIds:
         return [i for v in self.groupes.values() for i in v]
 
 
-def verifier_ids(racine: str, texte: str, existe: Callable[[str], bool] = os.path.isdir) -> SaisieIds:
+# ID imm : « ID- » + code INSEE (5 caractères, Corse 2A/2B comprise) + numéro.
+_MOTIF_ID_IMM = re.compile(r"(?<![0-9A-Z])ID-((?:2[AB]\d{3})|\d{5})[0-9A-Z]+(?![0-9A-Z])")
+
+
+def extraire_ids_imm(texte: str) -> list[str]:
+    """ID imm d'un texte libre (``ID-58006000005V``…), en majuscules, sans doublon, dans l'ordre."""
+    return list(dict.fromkeys(m.group(0) for m in _MOTIF_ID_IMM.finditer((texte or "").upper())))
+
+
+def insee_de_id_imm(id_imm: str) -> str:
+    """Code commune d'un ID imm : les 5 caractères après « ID- » (``ID-2B030000006D`` → ``2B030``)."""
+    m = _MOTIF_ID_IMM.fullmatch("".join(str(id_imm or "").split()).upper())
+    return m.group(1) if m else ""
+
+
+def grouper_ids_imm(ids: Iterable[str]) -> dict[str, list[str]]:
+    groupes: dict[str, list[str]] = {}
+    for i in ids:
+        insee = insee_de_id_imm(i)
+        if insee and i not in groupes.setdefault(insee, []):
+            groupes[insee].append(i)
+    return groupes
+
+
+def verifier_ids(racine: str, texte: str, existe: Callable[[str], bool] = os.path.isdir,
+                 type_ids: str = "id_erreur") -> SaisieIds:
     """Texte libre (ID séparés par espaces, virgules, retours à la ligne…) → ID par commune.
 
     Même lecture que complete_excel_files (``sna.services.identifiants``) : un ID
@@ -131,8 +156,12 @@ def verifier_ids(racine: str, texte: str, existe: Callable[[str], bool] = os.pat
     désigne la commune, donc le dossier ``<racine>/Dep<XX>/<insee>``. Les codes
     INSEE saisis seuls sont remontés à part : sans numéro, aucune ligne à auditer.
     """
-    saisie = SaisieIds(codes_sans_id=codes_sans_id(texte or ""))
-    groupes = groupes_depuis_texte(texte or "")
+    if type_ids == "id_imm":     # ID imm : la commune est dans les 5 caractères après « ID- »
+        saisie = SaisieIds()
+        groupes = grouper_ids_imm(extraire_ids_imm(texte or ""))
+    else:
+        saisie = SaisieIds(codes_sans_id=codes_sans_id(texte or ""))
+        groupes = groupes_depuis_texte(texte or "")
     verification = verifier_communes(racine, list(groupes), existe)
     saisie.trouvees = verification.trouvees
     saisie.groupes = {c.code: groupes[c.code] for c in verification.trouvees}

@@ -13,7 +13,10 @@ from sna.models.base import Statut
 from sna.models.regles import Action, Condition, RegleModification, ReglesConfig, SourceValeur
 from sna.services.excel import appliquer_regles
 
+from .conftest import ecrire_audit, imm
+
 COMMUNES = ["13001", "13002", "2A004", "75021"]
+IMM = "ID imm"   # identifiant des mises à jour (cf. avf.ui.application)
 
 
 def _valeurs(chemin, feuille="Audit"):
@@ -75,9 +78,9 @@ def test_preparer_regles_ne_touche_pas_recopie_ni_effacement():
 def test_groupes_depuis_rapport(racine):
     rapport = auditer_communes(COMMUNES, racine)
     assert groupes_depuis_rapport(rapport) == {
-        "13001": ["13001_2", "13001_3", "13001_4", "13001_5"],
-        "2A004": ["2A004_1", "2A004_2"],
-        "75021": ["75021_1"],
+        "13001": [imm("13001", n) for n in (3, 4, 5, 6, 7)],
+        "2A004": [imm("2A004", 2), imm("2A004", 3)],
+        "75021": [imm("75021", 2)],
     }
     assert list(groupes_depuis_rapport(rapport, ["2A004", "13002"])) == ["2A004"]
 
@@ -92,7 +95,7 @@ def test_mise_a_jour_corrige_les_ids_non_valides(racine, tmp_path):
 
     bilan = mettre_a_jour(
         groupes, regles, racine, fichier_attente=attente_json,
-        on_etape=lambda c, m: etapes.append(c), on_resultat=resultats.append,
+        on_etape=lambda c, m: etapes.append(c), on_resultat=resultats.append, colonne_id=IMM,
     )
 
     par_commune = {r.commune: r for r in bilan.resultats}
@@ -101,10 +104,11 @@ def test_mise_a_jour_corrige_les_ids_non_valides(racine, tmp_path):
     # Copie de conflit : refus, exactement comme complete_excel_files
     assert par_commune["75021"].statut is Statut.ERREUR
     assert "conflit" in par_commune["75021"].message
-    assert bilan.echecs == {"75021_1": par_commune["75021"].message}
-    assert sorted(bilan.reussis) == ["13001_2", "13001_3", "13001_4", "13001_5", "2A004_1", "2A004_2"]
+    assert bilan.echecs == {imm("75021", 2): par_commune["75021"].message}
+    assert sorted(bilan.reussis) == sorted([imm("13001", n) for n in (3, 4, 5, 6, 7)]
+                                           + [imm("2A004", 2), imm("2A004", 3)])
     assert bilan.nb_en_attente == 1
-    assert list(json.load(open(attente_json, encoding="utf-8"))) == ["75021_1"]
+    assert list(json.load(open(attente_json, encoding="utf-8"))) == [imm("75021", 2)]
     assert len(resultats) == 3 and etapes
 
     lignes = _valeurs(os.path.join(racine, "Dep13", "13001", "audit_13001.xlsx"))
@@ -131,7 +135,7 @@ def test_mise_a_jour_corrige_les_ids_non_valides(racine, tmp_path):
 
     # Ré-audit : plus aucun ID non valide hors conflit
     apres = auditer_communes(COMMUNES, racine)
-    assert apres.ids_non_valides_par_commune() == {"75021": ["75021_1"]}
+    assert apres.ids_non_valides_par_commune() == {"75021": [imm("75021", 2)]}
     assert apres.commune("13001").complete
 
 
@@ -142,14 +146,14 @@ def test_simulation_n_ecrit_rien(racine, tmp_path):
     attente_json = str(tmp_path / "attente.json")
     bilan = mettre_a_jour(
         groupes_depuis_rapport(rapport), ReglesConfig.defaut(), racine,
-        simuler=True, fichier_attente=attente_json,
+        simuler=True, fichier_attente=attente_json, colonne_id=IMM,
     )
     # 13001_2 : 4 cellules · 13001_3 : 4 (KO → OK) · 13001_4 : 3 (Audit déjà OK)
     # · 13001_5 : 3 (Validation finale déjà OK) + 4
     assert bilan.simulation and bilan.nb_modifications == 18
     assert open(chemin, "rb").read() == avant[1]
     assert not os.path.exists(attente_json)
-    assert auditer_communes(["13001"], racine).nb_ids_non_valides == 4
+    assert auditer_communes(["13001"], racine).nb_ids_non_valides == 5
 
 
 def test_meme_resultat_que_le_moteur_appele_directement(racine, tmp_path):
@@ -159,6 +163,7 @@ def test_meme_resultat_que_le_moteur_appele_directement(racine, tmp_path):
     original = os.path.join(racine, "Dep13", "13001", "audit_13001.xlsx")
     shutil.copy(original, copie)
     regles = preparer_regles(ReglesConfig.defaut(), "Date audit", True)
+    regles.colonne_id = IMM
     ids = groupes_depuis_rapport(auditer_communes(["13001"], racine))["13001"]
 
     appliquer_regles(copie, regles, ids)
@@ -175,7 +180,7 @@ def test_regles_personnalisees_avec_condition(racine):
         RegleModification("R3", action=Action("Validation finale", SourceValeur.VALEUR, "VALIDE")),
     ])
     rapport = auditer_communes(["13001"], racine)
-    mettre_a_jour(groupes_depuis_rapport(rapport), regles, racine)
+    mettre_a_jour(groupes_depuis_rapport(rapport), regles, racine, colonne_id=IMM)
     lignes = _valeurs(os.path.join(racine, "Dep13", "13001", "audit_13001.xlsx"))
     ligne_13001_2, ligne_13001_3 = lignes[1], lignes[2]
     assert ligne_13001_3["Audit"] == "KO"                 # non vide : conservé
@@ -207,7 +212,7 @@ def test_via_excel_utilise_la_session(racine):
     rapport = auditer_communes(["13001", "2A004"], racine)
     bilan = mettre_a_jour(
         groupes_depuis_rapport(rapport), ReglesConfig.defaut(), racine,
-        via_excel=True, session_factory=lambda: session,
+        via_excel=True, session_factory=lambda: session, colonne_id=IMM,
     )
     assert bilan.via_excel
     assert [a[0] for a in session.appels] == ["audit_13001.xlsx", "audit_2A004.xlsx"]
@@ -245,7 +250,7 @@ from sna.services.excel_com import excel_disponible  # noqa: E402
 def test_mise_a_jour_via_excel_reel(racine):
     rapport = auditer_communes(["13001"], racine)
     regles = preparer_regles(ReglesConfig.defaut(), "Date audit", True, aujourd_hui=date(2026, 11, 24))
-    bilan = mettre_a_jour(groupes_depuis_rapport(rapport), regles, racine, via_excel=True)
+    bilan = mettre_a_jour(groupes_depuis_rapport(rapport), regles, racine, via_excel=True, colonne_id=IMM)
     assert bilan.via_excel
     resultat = bilan.resultats[0]
     assert resultat.statut is Statut.SUCCES, resultat.message
@@ -261,14 +266,15 @@ def test_mise_a_jour_parallele_identique(racine, tmp_path):
     copie = str(tmp_path / "copie")
     shutil.copytree(racine, copie)
     regles = preparer_regles(ReglesConfig.defaut(), aujourd_hui=date(2026, 11, 24))
-    seq = mettre_a_jour(groupes_depuis_rapport(auditer_communes(COMMUNES, racine)), regles, racine)
+    seq = mettre_a_jour(groupes_depuis_rapport(auditer_communes(COMMUNES, racine)), regles, racine,
+                        colonne_id=IMM)
     par = mettre_a_jour(groupes_depuis_rapport(auditer_communes(COMMUNES, copie)), regles, copie,
-                        paralleles=4)
+                        paralleles=4, colonne_id=IMM)
     assert [(r.commune, r.statut, r.nb_modifications) for r in par.resultats] == \
            [(r.commune, r.statut, r.nb_modifications) for r in seq.resultats]
     assert par.echecs.keys() == seq.echecs.keys() and sorted(par.reussis) == sorted(seq.reussis)
     assert not par.interrompu
-    assert auditer_communes(COMMUNES, copie).ids_non_valides_par_commune() == {"75021": ["75021_1"]}
+    assert auditer_communes(COMMUNES, copie).ids_non_valides_par_commune() == {"75021": [imm("75021", 2)]}
 
 
 def test_arret_de_la_mise_a_jour(racine, tmp_path):
@@ -276,9 +282,46 @@ def test_arret_de_la_mise_a_jour(racine, tmp_path):
     groupes = groupes_depuis_rapport(auditer_communes(COMMUNES, racine))
     appels = iter([False, True, True, True])
     bilan = mettre_a_jour(groupes, ReglesConfig.defaut(), racine, fichier_attente=attente_json,
-                          doit_arreter=lambda: next(appels))
+                          doit_arreter=lambda: next(appels), colonne_id=IMM)
     assert bilan.communes_traitees == ["13001"] and bilan.interrompu
     assert bilan.nb_communes_demandees == 3
     # Les communes non commencées ne sont ni en échec ni réussies : intactes et hors attente
     assert bilan.echecs == {} and bilan.nb_en_attente == 0
     assert set(auditer_communes(COMMUNES, racine).ids_non_valides_par_commune()) == {"2A004", "75021"}
+
+
+
+# ── Le problème corrigé : un ID erreur partagé par plusieurs logements ──
+def test_id_erreur_partage_seule_la_ligne_non_valide_est_modifiee(tmp_path):
+    """« 38071_146 » couvre plusieurs logements (ID imm différents) : un seul n'est pas validé.
+
+    Par ID erreur, la mise à jour réécrivait AUSSI le logement déjà validé (son auditeur
+    « Alice » devenait « Validation en masse »). Par ID imm, seule sa ligne est touchée.
+    """
+    racine = str(tmp_path)
+    chemin = ecrire_audit(os.path.join(racine, "Dep38", "38071", "audit_38071.xlsx"), [
+        ["38071_146", "a", "OK", datetime(2026, 3, 1), "Alice", "OK", "ID-380710000139"],
+        ["38071_146", "b", None, None, None, None, "ID-38071000013A"],
+        ["38071_146", "c", "KO", datetime(2026, 3, 2), "Bob", "OK", "ID-38071000013B"],
+    ])
+    rapport = auditer_communes(["38071"], racine)
+    assert rapport.ids_non_valides_par_commune() == {"38071": ["ID-38071000013A"]}
+    regles = preparer_regles(ReglesConfig.defaut(), aujourd_hui=date(2026, 11, 27))
+    bilan = mettre_a_jour(groupes_depuis_rapport(rapport), regles, racine, colonne_id=IMM)
+    assert bilan.reussis == ["ID-38071000013A"] and bilan.resultats[0].nb_lignes == 1
+    a, b, c = _valeurs(chemin)
+    assert (a["Auditeur"], a["Date audit"]) == ("Alice", datetime(2026, 3, 1))        # intact
+    assert (c["Audit"], c["Auditeur"]) == ("KO", "Bob")                                # intact
+    assert (b["Audit"], b["Auditeur"], b["Validation finale"]) == ("OK", "Validation en masse", "OK")
+    assert auditer_communes(["38071"], racine).commune("38071").complete
+
+
+def test_par_id_erreur_toutes_les_lignes_seraient_touchees(tmp_path):
+    """Témoin : ce que faisait l'identification par ID erreur sur le même fichier."""
+    racine = str(tmp_path)
+    chemin = ecrire_audit(os.path.join(racine, "Dep38", "38071", "audit_38071.xlsx"), [
+        ["38071_146", "a", "OK", datetime(2026, 3, 1), "Alice", "OK", "ID-380710000139"],
+        ["38071_146", "b", None, None, None, None, "ID-38071000013A"],
+    ])
+    mettre_a_jour({"38071": ["38071_146"]}, ReglesConfig.defaut(), racine)   # colonne « ID erreur »
+    assert _valeurs(chemin)[0]["Auditeur"] == "Validation en masse"           # le logement validé écrasé

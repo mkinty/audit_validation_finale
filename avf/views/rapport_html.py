@@ -2,14 +2,15 @@
 
 Contenu :
     - en-tête : racine, date, durée, colonnes et critères contrôlés ;
-    - indicateurs : communes, ID erreur, lignes validées / non valides ;
+    - indicateurs : communes, ID imm, lignes validées / non valides ;
     - motifs de non-validité (critère par critère) et synthèse par département ;
     - tableau des communes (tri, recherche, filtre par état), chaque ligne se
-      dépliant sur ses lignes auditées : ID erreur, ligne, statut, Audit, Date
+      dépliant sur ses lignes auditées : ID imm, ID erreur, ligne, statut, Audit, Date
       audit, Auditeur, Validation finale et motifs ;
     - comme dans audit_ppts, le détail ne montre que les lignes non valides ;
       la case « Afficher aussi les validées » y ajoute les autres ;
-    - copie en un clic des ID erreur non valides, avec le séparateur choisi
+    - copie en un clic des **ID imm** non valides (l'identifiant des mises à jour),
+      avec le séparateur choisi
       (un par ligne par défaut — prêt à coller dans complete_excel_files).
 
 Le fichier reste lisible sans JavaScript (tout est rendu côté Python) ; le
@@ -23,6 +24,8 @@ from html import escape
 import json
 
 from ..models.audit import NON_VALIDES, AuditCommune, LigneAudit, RapportAudit
+from sna.services.identifiants import normaliser_id
+
 from . import presentation as p
 
 
@@ -42,9 +45,9 @@ def generer_html(rapport: RapportAudit) -> str:
         lignes=_lignes_communes(rapport),
         nb_non_valides=p.nombre(nb_nv),
         desactive_tout="" if nb_nv else "disabled",
-        tous_ids=escape(p.texte_ids(rapport.ids_de(NON_VALIDES))) or "Aucun ID erreur non valide.",
+        tous_ids=escape(p.texte_ids(rapport.ids_de(NON_VALIDES))) or f"Aucun {rapport.colonnes.id_imm} non valide.",
         echecs=_echecs(rapport),
-        colonne_id=escape(rapport.colonne_id),
+        colonne_id=escape(rapport.colonnes.id_imm),
         donnees=_json_script(donnees),
         script=_JS,
     )
@@ -55,7 +58,7 @@ def _entete(r: RapportAudit) -> str:
     c = r.colonnes
     colonnes = ", ".join(
         f"<code>{escape(n)}</code>"
-        for n in (r.colonne_id, c.audit, c.date_audit, c.auditeur, c.validation)
+        for n in (c.id_imm, r.colonne_id, c.audit, c.date_audit, c.auditeur, c.validation)
     )
     criteres = " · ".join(escape(t) for t in p.libelles_criteres(c).values())
     return (
@@ -88,7 +91,7 @@ def _indicateurs(r: RapportAudit) -> str:
             f"❌ {p.nombre(len(r.en_echec))} en échec",
         ),
         _tuile(
-            "ID erreur", p.nombre(r.nb_ids),
+            escape(r.colonnes.id_imm), p.nombre(r.nb_ids),
             f"⚠️ {p.nombre(r.nb_ids_non_valides)} non valide(s) · "
             f"✅ {p.nombre(r.nb_ids_valides)} validé(s)",
         ),
@@ -167,12 +170,13 @@ def _lignes_communes(r: RapportAudit) -> str:
 
 def _ligne_commune(c: AuditCommune, r: RapportAudit) -> str:
     e = p.etat(c)
-    recherche = " ".join([c.commune, f"dep{c.departement}", *(i.id_erreur for i in c.ids)]).lower()
+    recherche = " ".join([c.commune, f"dep{c.departement}",
+                          *(x for l in c.lignes for x in (l.id_imm, l.id_erreur))]).lower()
     taux_tri = -1 if c.taux is None else c.taux
     alerte = f' <span class="alerte" title="{escape(" · ".join(c.avertissements))}">⚠</span>' if c.avertissements else ""
     copier = (
         f'<button type="button" class="btn btn-petit" data-copier="{escape(c.commune)}" '
-        f'title="Copier les {c.nb_ids_non_valides} ID erreur non valides">'
+        f'title="Copier les {c.nb_ids_non_valides} {escape(r.colonnes.id_imm)} non valides">'
         f'📋 Copier ({p.nombre(c.nb_ids_non_valides)})</button>'
         if c.nb_ids_non_valides else ""
     )
@@ -217,16 +221,16 @@ def _detail(c: AuditCommune, r: RapportAudit) -> str:
             for i in c.ids_non_valides
         )
         morceaux.append(
-            f'<div class="sous-titre">ID erreur non valides ({p.nombre(c.nb_ids_non_valides)}) '
+            f'<div class="sous-titre">{escape(r.colonnes.id_imm)} non valides ({p.nombre(c.nb_ids_non_valides)}) '
             f"— cliquer sur un ID pour le copier</div>"
             f'<div class="puces">{puces}</div>'
         )
     col = r.colonnes
-    doublons = {i.id_erreur for i in c.ids if i.doublon}
-    lignes = "".join(_ligne_detail(l, l.id_erreur in doublons) for l in c.lignes)
+    doublons = {i.identifiant for i in c.identifiables if i.doublon}
+    lignes = "".join(_ligne_detail(l, normaliser_id(l.id_imm) in doublons) for l in c.lignes)
     morceaux.append(
         '<table class="table-detail"><thead><tr>'
-        f"<th>{escape(r.colonne_id)}</th><th class=\"num\">Ligne</th><th>Statut</th>"
+        f"<th>{escape(col.id_imm)}</th><th>{escape(r.colonne_id)}</th><th class=\"num\">Ligne</th><th>Statut</th>"
         f"<th>{escape(col.audit)}</th><th>{escape(col.date_audit)}</th><th>{escape(col.auditeur)}</th>"
         f"<th>{escape(col.validation)}</th><th>Motifs</th>"
         f"</tr></thead><tbody>{lignes}</tbody></table>"
@@ -238,9 +242,10 @@ def _detail(c: AuditCommune, r: RapportAudit) -> str:
 
 def _ligne_detail(l: LigneAudit, doublon: bool) -> str:
     e = p.etat_ligne(l)
-    marque = ' <span class="doublon" title="ID présent sur plusieurs lignes">×2+</span>' if doublon else ""
+    marque = ' <span class="doublon" title="ID imm présent sur plusieurs lignes (doublon)">×2+</span>' if doublon else ""
     return (
-        f'<tr class="l-{e.cle}"><td><code>{escape(l.id_erreur)}</code>{marque}</td>'
+        f'<tr class="l-{e.cle}"><td><code>{escape(l.id_imm) or _VIDE}</code>{marque}</td>'
+        f'<td><code>{escape(l.id_erreur) or _VIDE}</code></td>'
         f'<td class="num">{l.ligne}</td>'
         f'<td><span class="statut statut-{e.cle}">{e.icone} {e.libelle}</span></td>'
         f"<td>{escape(l.audit) or _VIDE}</td>"
@@ -316,7 +321,7 @@ _GABARIT = """<!DOCTYPE html>
   <div class="defile">
     <h2>Synthèse par département</h2>
     <table class="table">
-      <thead><tr><th>Département</th><th class="num">Communes</th><th class="num">ID erreur</th>
+      <thead><tr><th>Département</th><th class="num">Communes</th><th class="num">ID imm</th>
       <th class="num">Lignes</th><th class="num">Validées</th><th class="num">Non valides</th>
       <th class="num">En échec</th><th>Taux validé</th></tr></thead>
       <tbody>{departements}</tbody>
@@ -327,7 +332,7 @@ _GABARIT = """<!DOCTYPE html>
 <section class="carte">
   <div class="barre-outils">
     <h2>Communes</h2>
-    <input type="search" id="recherche" placeholder="Commune ou ID erreur…" aria-label="Rechercher">
+    <input type="search" id="recherche" placeholder="Commune, ID imm ou ID erreur…" aria-label="Rechercher">
     <div class="filtres" role="group" aria-label="Filtrer par état">
       <button type="button" class="filtre actif" data-filtre="tous">Toutes</button>
       <button type="button" class="filtre" data-filtre="a-corriger">⚠️ À corriger</button>
@@ -344,13 +349,13 @@ _GABARIT = """<!DOCTYPE html>
         <option value="espace">espace</option>
       </select>
     </label>
-    <button type="button" class="btn btn-principal" data-copier-tout="visibles" title="Copie les ID erreur non valides des communes affichées (filtre et recherche pris en compte)">📋 Copier les ID non valides affichés (<span id="nb-visibles">{nb_non_valides}</span>)</button>
+    <button type="button" class="btn btn-principal" data-copier-tout="visibles" title="Copie les ID imm non valides des communes affichées (filtre et recherche pris en compte)">📋 Copier les ID non valides affichés (<span id="nb-visibles">{nb_non_valides}</span>)</button>
   </div>
   <div class="defile">
   <table class="table" id="communes">
     <thead><tr>
       <th data-tri="dep">Département</th><th data-tri="commune">Commune</th>
-      <th data-tri="ids" class="num">ID erreur</th><th data-tri="lignes" class="num">Lignes</th>
+      <th data-tri="ids" class="num">ID imm</th><th data-tri="lignes" class="num">Lignes</th>
       <th data-tri="ok" class="num">Validées</th><th data-tri="nv" class="num">Non valides</th>
       <th data-tri="taux">Taux validé</th><th data-tri="etat">État</th><th>Copie</th>
     </tr></thead>
@@ -545,7 +550,7 @@ _JS = r"""
     let ok = false;
     try { await navigator.clipboard.writeText(texte); ok = true; }
     catch(e){ ok = copieSecours(texte); }
-    toast(ok ? `✓ ${ids.length} ID erreur copié${ids.length > 1 ? 's' : ''}` : 'Copie impossible — sélectionnez le texte manuellement');
+    toast(ok ? `✓ ${ids.length} ID imm copié${ids.length > 1 ? 's' : ''}` : 'Copie impossible — sélectionnez le texte manuellement');
   }
   function idsVisibles(){
     const visibles = new Set([...document.querySelectorAll('#communes tr.commune')]

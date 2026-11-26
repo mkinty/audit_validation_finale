@@ -99,19 +99,43 @@ def test_colonne_id_absente(racine):
 
 def test_colonnes_controlees_toutes_obligatoires(tmp_path):
     chemin = ecrire_audit(
-        str(tmp_path / "audit_x.xlsx"), [["13001_1", "OK"]],
-        entetes=["ID erreur", "Validation finale"],
+        str(tmp_path / "audit_x.xlsx"), [["13001_1", "OK", "ID-130010000002"]],
+        entetes=["ID erreur", "Validation finale", "ID imm"],
     )
     with pytest.raises(ColonneAbsente, match="« Audit », « Date audit », « Auditeur » introuvables"):
         lire_audit(chemin, "ID erreur", ColonnesAudit())
 
 
+def test_colonne_id_imm_obligatoire(tmp_path):
+    entetes = ["ID erreur", "Audit", "Date audit", "Auditeur", "Validation finale"]
+    chemin = ecrire_audit(str(tmp_path / "audit_x.xlsx"), [["13001_1", "OK", "01/01/2026", "Al", "OK"]],
+                          entetes=entetes)
+    with pytest.raises(ColonneAbsente, match="« ID imm » introuvable — c'est l'identifiant unique"):
+        lire_audit(chemin, "ID erreur", ColonnesAudit())
+
+
+def test_lignes_avec_id_erreur_ou_id_imm(tmp_path):
+    chemin = ecrire_audit(str(tmp_path / "audit_x.xlsx"), [
+        ["13001_1", "a", "OK", None, None, None, "ID-130010000002"],
+        [None, "b", "OK", None, None, None, "ID-130010000003"],     # ID imm sans ID erreur
+        ["13001_3", "c", "OK", None, None, None, None],             # ID erreur sans ID imm
+        [None, "rien", None, None, None, None, None],               # ignorée
+    ])
+    for forcer in (False, True):
+        from avf.services import lecture_audit as module
+        lire = module._lire_openpyxl if forcer else module._lire_rapide
+        lecture = lire(chemin, "ID erreur", ColonnesAudit(), 1)
+        assert [(l.ligne, l.id_erreur, l.id_imm) for l in lecture.lignes] == [
+            (2, "13001_1", "ID-130010000002"), (3, "", "ID-130010000003"), (4, "13001_3", "")]
+
+
 def test_noms_de_colonnes_personnalises_et_casse(tmp_path):
     chemin = ecrire_audit(
-        str(tmp_path / "audit_x.xlsx"), [["13001_1", "", "Moi", "OK", "01/01/2026"]],
-        entetes=["id ERREUR", "VF", "Contrôleur", "statut", "le"],
+        str(tmp_path / "audit_x.xlsx"), [["13001_1", "", "Moi", "OK", "01/01/2026", "ID-1"]],
+        entetes=["id ERREUR", "VF", "Contrôleur", "statut", "le", "Immeuble"],
     )
-    colonnes = ColonnesAudit(validation="vf", auditeur="contrôleur", audit="Statut", date_audit="LE")
+    colonnes = ColonnesAudit(validation="vf", auditeur="contrôleur", audit="Statut", date_audit="LE",
+                             id_imm="IMMEUBLE")
     lecture = lire_audit(chemin, "ID erreur", colonnes)
     ligne = lecture.lignes[0]
     assert (ligne.auditeur, ligne.audit, ligne.date_audit, ligne.validation) == ("Moi", "OK", "01/01/2026", "")
