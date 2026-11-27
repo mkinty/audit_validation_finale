@@ -157,7 +157,11 @@ def _diagnostic_excel(cible: str, session_factory, excel_present, dire) -> bool:
         return True
     except Exception as exc:  # noqa: BLE001
         texte = (str(exc) or exc.__class__.__name__).split("\n")[0][:300]
-        dire(KO, f"Excel ne peut pas ouvrir ce fichier : {texte} — vérifiez Excel › Fichier › Compte (compte "
+        if "démarrer Excel" in texte or exc.__class__.__name__ == "ExcelIndisponible":
+            dire(KO, f"Excel n'a pas pu DÉMARRER depuis l'outil : {texte} — le compte Office n'est pas en "
+                     "cause ; fermez les fenêtres Excel bloquées (Gestionnaire des tâches) et réessayez")
+            return False
+        dire(KO,f"Excel ne peut pas ouvrir ce fichier : {texte} — vérifiez Excel › Fichier › Compte (compte "
                  "de l'organisation) ; si le poste n'est pas autorisé par l'informatique, la co-édition "
                  "depuis ce poste est impossible")
         return False

@@ -69,6 +69,13 @@ complete_excel_files**. Chacun est couvert par
   ouvert, puis il est enregistré sans être fermé, et `AutoSaveOn` n'est pas touché.
   Si rien n'est trouvé, le comportement d'origine s'applique : verrouillé, rien n'est écrit.
 
+- **Excel ne démarrait jamais sur un Windows en français** (« impossible de démarrer Excel :
+  'NoneType' object has no attribute 'splitlines' »). Quand aucun Excel ne tourne,
+  `tasklist` répond « aucune tâche… » en page de codes console. Avec `text=True`, le
+  décodage échouait dans le fil de lecture de `subprocess` et `stdout` valait `None`.
+  `_pids_excel` lit maintenant des octets et ne lève plus. **À reporter en priorité dans
+  complete_excel_files**, qui a le même code.
+
 ### `services/attente.py`
 
 - Un ID « non confirmé » saisi sous une autre forme (`2a004_1` pour `2A004_1`)

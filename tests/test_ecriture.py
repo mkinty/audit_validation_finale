@@ -333,3 +333,27 @@ def test_reglages_des_reprises():
 def test_conseil_excel_et_verrou():
     assert "Fichier › Compte" in p.conseil_refus("Excel n'a pas pu ouvrir ce fichier : x")
     assert "🩺" in p.conseil_refus("classeur verrouillé par Bob")
+
+
+# ── Démarrage d'Excel : réponse française de tasklist ────────────────
+@pytest.mark.parametrize("sortie", [
+    b"Information\xff: aucune t\x83che en service ne correspond aux crit\x8ares sp\x82cifi\x82s.\r\n",  # réel
+    None,
+])
+def test_pids_excel_reponse_francaise_sans_excel(monkeypatch, sortie):
+    """Régression : « 'NoneType' object has no attribute 'splitlines' » empêchait Excel de démarrer."""
+    import subprocess
+
+    class _Resultat:
+        stdout = sortie
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: _Resultat())
+    assert excel_com._pids_excel() == set()
+
+
+def test_pids_excel_lit_les_pid(monkeypatch):
+    import subprocess
+
+    class _Resultat:
+        stdout = b'"EXCEL.EXE","4242","Console","1","95\xff000 Ko"\r\n"EXCEL.EXE","77","Console","1","1 Ko"\r\n'
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: _Resultat())
+    assert excel_com._pids_excel() == {4242, 77}

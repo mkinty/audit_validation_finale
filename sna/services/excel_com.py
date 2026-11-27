@@ -246,16 +246,22 @@ def _pid_de(xl):
 
 def _pids_excel() -> set[int]:
     """PID de tous les processus EXCEL.EXE du poste (repli si la fenêtre ne donne pas le PID)."""
+    # Ajout (cf. PROVENANCE.md) : lu en OCTETS puis décodé sans erreur possible. Avec
+    # ``text=True``, la réponse française de tasklist quand aucun Excel ne tourne
+    # (« aucune tâche en service ne correspond aux critères », accents en page de codes
+    # console) faisait échouer le décodage dans le fil de lecture : ``stdout`` valait
+    # ``None`` et Excel ne démarrait jamais (« 'NoneType' object has no attribute 'splitlines' »).
     try:
-        sortie = subprocess.run(
+        brut = subprocess.run(
             ["tasklist", "/FI", "IMAGENAME eq EXCEL.EXE", "/FO", "CSV", "/NH"],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True, timeout=10,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         ).stdout
-    except Exception:  # noqa: BLE001
+        sortie = (brut or b"").decode("ascii", errors="ignore") if isinstance(brut, bytes) else str(brut or "")
+        return {int(champs[1]) for champs in csv.reader(sortie.splitlines())
+                if len(champs) > 1 and champs[1].strip().isdigit()}
+    except Exception:  # noqa: BLE001 — sans la liste, seul le PID par la fenêtre sert
         return set()
-    return {int(champs[1]) for champs in csv.reader(sortie.splitlines())
-            if len(champs) > 1 and champs[1].strip().isdigit()}
 
 
 def _terminer_si_toujours_ouvert(pid: int | None, attente_s: float = 15) -> None:
