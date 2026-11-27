@@ -50,6 +50,8 @@ class Parametres:
     reauditer: bool = True
     dossier_export: str = ""
     paralleles: int = PARALLELES_DEFAUT
+    reprises_verrou: int = 3          # nouveaux essais d'un fichier ouvert par quelqu'un
+    delai_reprise_s: int = 60         # secondes entre deux essais
 
     def to_dict(self) -> dict:
         return {
@@ -66,6 +68,8 @@ class Parametres:
             "reauditer": self.reauditer,
             "dossier_export": self.dossier_export,
             "paralleles": self.paralleles,
+            "reprises_verrou": self.reprises_verrou,
+            "delai_reprise_s": self.delai_reprise_s,
         }
 
     @staticmethod
@@ -86,6 +90,8 @@ class Parametres:
             reauditer=bool(data.get("reauditer", defaut.reauditer)),
             dossier_export=str(data.get("dossier_export") or ""),
             paralleles=_paralleles(data.get("paralleles", defaut.paralleles)),
+            reprises_verrou=_entier(data.get("reprises_verrou"), defaut.reprises_verrou, 0, 20),
+            delai_reprise_s=_entier(data.get("delai_reprise_s"), defaut.delai_reprise_s, 5, 900),
         )
         # Identifiant des mises à jour : l'ID imm (unique par ligne), plus l'ID erreur.
         # Ancienne configuration : la colonne ID erreur personnalisée était celle des règles.
@@ -95,6 +101,13 @@ class Parametres:
             parametres.colonnes.id_erreur = ancien_id
         parametres.regles.colonne_id = parametres.colonnes.id_imm
         return parametres
+
+
+def _entier(valeur, defaut: int, minimum: int, maximum: int) -> int:
+    try:
+        return max(minimum, min(maximum, int(valeur)))
+    except (TypeError, ValueError):
+        return defaut
 
 
 def charger(fichier: str = CONFIG_FILE) -> Parametres:

@@ -139,7 +139,7 @@ def test_fichier_ouvert_sans_excel_rien_ecrit_et_raison(fichier):
     with SessionEcriture(None) as ecriture:
         bilan = ecriture.appliquer_regles(fichier, _config(), [imm("13001", 2)])
     assert open(fichier, "rb").read() == avant
-    assert bilan.verrouille.startswith("Alice Martin (fichier ouvert)")
+    assert bilan.verrouille.startswith("Alice Martin — l'écriture dans un fichier ouvert")
     assert "co-édition Excel, indisponible (Excel / pywin32 introuvables" in bilan.verrouille
 
 
@@ -256,3 +256,80 @@ def test_encore_non_valides_apres_reaudit(racine):
 def test_cle_classeur_compare_chemins_et_adresses():
     assert excel_com._cle_classeur(r"C:\A\audit 1.xlsx") == excel_com._cle_classeur("c:/a/audit%201.xlsx")
     assert excel_com._classeur_ouvert_ailleurs([None, ""]) is None
+
+
+def test_erreur_de_structure_jamais_rattrapee_par_l_api(fichier):
+    from sna.services.excel import ColonneIntrouvable
+
+    class _ExcelColonne(_Excel):
+        def appliquer_regles(self, fichier, config, ids, on_etape=None):
+            raise ColonneIntrouvable("colonne « ID imm » absente")
+
+    journal = []
+    with SessionEcriture(lambda: _ExcelColonne(journal), repli=_Api(journal)) as ecriture:
+        with pytest.raises(ColonneIntrouvable):
+            ecriture.appliquer_regles(fichier, _config(), [imm("13001", 2)])
+    assert journal == []
+
+
+# ── Diagnostic (lecture seule) ───────────────────────────────────────
+class _ExcelCopie:
+    def __init__(self, erreur=None):
+        self.erreur = erreur
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def copier_version_serveur(self, adresse, destination, on_etape=None):
+        if self.erreur:
+            raise self.erreur
+        open(destination, "wb").write(b"x")
+        return destination
+
+
+def test_diagnostic_local_fichier_ouvert_excel_ok(racine):
+    from avf.models.source import LOCAL, SourceAudit
+    from avf.services.diagnostic_ecriture import KO, OK, diagnostiquer_ecriture
+    chemin = os.path.join(racine, "Dep13", "13001", "audit_13001.xlsx")
+    _verrou(chemin)
+    avant = open(chemin, "rb").read()
+    lignes = diagnostiquer_ecriture(SourceAudit(LOCAL, racine), "13001", session_factory=_ExcelCopie,
+                                    excel_present=lambda: True)
+    assert any(e == KO and "ouvert par Alice Martin" in t for e, t in lignes)
+    assert any(e == OK and "co-édition est possible" in t for e, t in lignes)
+    assert lignes[-1] == (OK, lignes[-1][1]) and "CONCLUSION" in lignes[-1][1]
+    assert open(chemin, "rb").read() == avant
+
+
+def test_diagnostic_excel_refuse(racine):
+    from avf.models.source import URL, SourceAudit
+    from avf.services.diagnostic_ecriture import KO, diagnostiquer_ecriture
+    source = SourceAudit(URL, "https://x.sharepoint.com/sites/S/Docs/audit", "https://x.sharepoint.com/sites/S/Docs/audit")
+    lignes = diagnostiquer_ecriture(source, "13001", session_factory=lambda: _ExcelCopie(OSError("accès refusé")),
+                                    excel_present=lambda: True)
+    assert any("Dep13/13001/audit_13001.xlsx" in t for _, t in lignes)
+    assert any(e == KO and "Excel ne peut pas ouvrir ce fichier : accès refusé" in t for e, t in lignes)
+    assert lignes[-1][1].startswith("CONCLUSION : aucune voie")
+
+
+def test_diagnostic_commune_absente(racine):
+    from avf.models.source import LOCAL, SourceAudit
+    from avf.services.diagnostic_ecriture import diagnostiquer_ecriture
+    lignes = diagnostiquer_ecriture(SourceAudit(LOCAL, racine), "99999", excel_present=lambda: True)
+    assert lignes[-1][1] == "fichier audit introuvable : rien à diagnostiquer"
+
+
+def test_reglages_des_reprises():
+    from avf.config import Parametres
+    assert (Parametres().reprises_verrou, Parametres().delai_reprise_s) == (3, 60)
+    p2 = Parametres.from_dict({"reprises_verrou": 99, "delai_reprise_s": "x"})
+    assert (p2.reprises_verrou, p2.delai_reprise_s) == (20, 60)
+    assert Parametres.from_dict(p2.to_dict()).reprises_verrou == 20
+
+
+def test_conseil_excel_et_verrou():
+    assert "Fichier › Compte" in p.conseil_refus("Excel n'a pas pu ouvrir ce fichier : x")
+    assert "🩺" in p.conseil_refus("classeur verrouillé par Bob")

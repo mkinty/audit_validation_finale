@@ -58,6 +58,7 @@ class SessionEcriture:
             "Excel / pywin32 introuvables sur ce poste" if excel_factory is None else "")
         self.excel_utilise = False
         self.repli_utilise = False
+        self.echecs_excel: dict[str, str] = {}   # fichier → pourquoi Excel n'a pas pu l'écrire
 
     def __enter__(self) -> "SessionEcriture":
         if self.repli is not None and hasattr(self.repli, "__enter__"):
@@ -97,7 +98,14 @@ class SessionEcriture:
             bilan = self.excel.appliquer_regles(fichier, config, ids, on_etape=on_etape)
         except Exception as exc:  # noqa: BLE001
             if not _excel_hors_service(exc):
-                raise                       # erreur propre à ce fichier : la commune échoue, expliquée
+                if _structurelle(exc) or self.repli is None:
+                    raise                   # erreur propre à ce fichier : la commune échoue, expliquée
+                # Excel n'a pas pu ouvrir / enregistrer CE fichier (adresse refusée, compte
+                # Office, appareil non autorisé…) : la voie API est encore possible.
+                self.echecs_excel[fichier] = _raison(exc)
+                dire(f"⚠ Excel n'a pas pu écrire ce fichier ({self.echecs_excel[fichier]}) — "
+                     "essai par l'API SharePoint")
+                return None
             self.raison_sans_excel = f"co-édition Excel impossible : {_raison(exc)}"
             dire(f"⚠ {self.raison_sans_excel} — écriture de repli")
             try:
@@ -145,8 +153,9 @@ class SessionEcriture:
             else:
                 bilan = appliquer_openpyxl(fichier, config, ids, on_etape=on_etape)
         if bilan.verrouille and "EXTRAIT" not in bilan.verrouille:
-            bilan.verrouille = (f"{bilan.verrouille} (fichier ouvert) — l'écriture dans un fichier ouvert "
-                                f"passe par la co-édition Excel, indisponible ({self.raison_sans_excel})")
+            cause = self.echecs_excel.get(fichier) and f"Excel n'a pas pu ouvrir ce fichier : {self.echecs_excel[fichier]}"
+            bilan.verrouille = (f"{bilan.verrouille} — l'écriture dans un fichier ouvert passe par la "
+                                f"co-édition Excel, indisponible ({cause or self.raison_sans_excel or 'raison inconnue'})")
         return bilan
 
 
@@ -195,6 +204,13 @@ def _excel_hors_service(exc: BaseException) -> bool:
     except ImportError:
         return False
     return isinstance(exc, (ConnexionRequise, ExcelIndisponible))
+
+
+def _structurelle(exc: BaseException) -> bool:
+    """Le fichier lui-même ne convient pas (onglet ou colonne absents) : aucune autre voie n'y changera rien."""
+    from sna.services.colonnes_excel import OngletIntrouvable
+    from sna.services.excel import ColonneIntrouvable
+    return isinstance(exc, (OngletIntrouvable, ColonneIntrouvable))
 
 
 def _raison(exc: BaseException) -> str:

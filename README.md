@@ -390,6 +390,27 @@ Deux cas ne peuvent pas être forcés. Les débloquer revient à celui qui a le 
 L'API Excel de Microsoft 365, qui écrirait des cellules sans Excel, n'est pas utilisable
 avec la connexion du navigateur : elle exige une application déclarée par l'informatique.
 
+**Lien SharePoint : ce qui diffère de « Parcourir ».** En mode « Parcourir » sur un dossier
+OneDrive, si Excel ne peut pas ouvrir l'adresse SharePoint, il ouvre la copie synchronisée, et
+OneDrive assure la co-édition. Avec un lien SharePoint, il n'y a pas de copie locale : la
+co-édition exige qu'**Excel ouvre lui-même l'adresse SharePoint** avec le compte Office du
+poste. Si Excel n'y parvient pas, l'outil se rabat sur l'API SharePoint, qui écrit les
+fichiers fermés mais que SharePoint refuse pour un fichier ouvert. Le journal donne alors les
+deux raisons : celle d'Excel, et le nom de la personne qui a le fichier ouvert.
+
+**Nouveaux essais.** Un fichier refusé parce qu'il est ouvert (sauf s'il est extrait) est
+retenté **3 fois, toutes les 60 s**. `■ Arrêter` interrompt l'attente. Ces valeurs se règlent
+par les clés `reprises_verrou` (0 à 20) et `delai_reprise_s` (5 à 900) de `config_audit_vf.json`.
+
+**`🩺 Diagnostic écriture`** (étape 4) essaie chaque voie d'écriture pour une commune, **sans
+rien écrire**, et affiche le résultat au journal :
+
+- le fichier : est-il extrait (check-out) ? est-il ouvert, et par qui ?
+- l'API SharePoint : la session est-elle valide, le téléchargement autorisé sur ce poste ?
+- Excel : ouvre-t-il le fichier (ou son adresse SharePoint) en lecture seule ?
+
+Il se termine par une **conclusion** qui dit ce qui se passera pour un fichier ouvert.
+
 **Pourquoi un ID imm n'est pas mis à jour.** En fin de mise à jour, le journal regroupe les
 ID refusés par raison, avec un conseil pour chacune :
 
@@ -496,13 +517,13 @@ audit_validation_finale/
 .venv\Scripts\python -m pytest
 ```
 
-561 tests : détection, lecture (chemin rapide et repli openpyxl comparés),
+576 tests : détection, lecture (chemin rapide et repli openpyxl comparés),
 critères de validité (dates en texte, casse, valeurs acceptées), audit par ligne et par
 ID, rapport HTML (structure, échappement, données de copie par catégorie), exports
 Excel et CSV, import de listes (txt, csv, xlsx), réactivité de l'interface avec de longues listes (liste réelle de 320 codes INSEE), identification par ID imm (ID erreur partagé par plusieurs logements, doublons, lignes sans ID imm, migration de configuration), audit limité à des ID erreur ou ID imm saisis, connexion SharePoint par le navigateur, audit et mise à jour par l'API (faux serveur SharePoint local : versions, verrous, modification concurrente), source SharePoint (formats de lien, WebDAV, bibliothèque synchronisée,
 lecture de la version serveur, connexion lente ou refusée, mise à jour forcée via Excel),
 configuration,
-fichiers ouverts (verrou `~$`, co-édition Excel à la demande, refus 423 rattrapé, classeur ouvert dans votre Excel, dossier OneDrive, raisons par ID imm au journal), mise à jour de bout en bout (valeurs écrites cellule par cellule, simulation,
+fichiers ouverts (verrou `~$`, co-édition Excel à la demande, refus 423 rattrapé, classeur ouvert dans votre Excel, dossier OneDrive, Excel refusant l'adresse SharePoint, nom de la personne qui a le fichier ouvert, nouveaux essais et arrêt, diagnostic en lecture seule, raisons par ID imm au journal), mise à jour de bout en bout (valeurs écrites cellule par cellule, simulation,
 conflit, règles personnalisées, identité avec le moteur appelé directement),
 écriture via une **vraie instance Excel** (ignorée sans Excel) — garde-fou anti-blocage, redémarrage, relecture par ID, appels concurrents —, traitement et audit en parallèle, arrêt, et interface
 Tkinter pilotée (détection des communes → audit → popup → « Afficher aussi les validées » →

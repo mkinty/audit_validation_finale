@@ -129,7 +129,11 @@ _CONSEILS = (
     ("non confirmée", "Excel a enregistré mais la relecture n'a pas retrouvé la valeur (fusion de "
                       "co-édition en cours) : ID remis en attente, rejoué à la prochaine mise à jour"),
     ("conflit", "une copie de conflit OneDrive existe : fusionnez-la ou supprimez-la, puis relancez"),
-    ("verrouillé", "ID remis en attente : relancez la mise à jour une fois le fichier libéré"),
+    ("Excel n'a pas pu", "vérifiez dans Excel (Fichier › Compte) que vous êtes connecté avec votre compte "
+                         "de l'organisation, puis lancez « 🩺 Diagnostic écriture »"),
+    ("verrouillé", "ID remis en attente : relancez la mise à jour une fois le fichier libéré, ou demandez à "
+                   "la personne de le fermer ; « 🩺 Diagnostic écriture » dit si la co-édition est possible "
+                   "sur ce poste"),
 )
 
 

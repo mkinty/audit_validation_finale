@@ -84,6 +84,9 @@ class _FauxSharePoint(http.server.BaseHTTPRequestHandler):
                         "de l'organisation, vous ne pouvez pas télécharger ces ressources à partir de cet appareil."}})
                 return self._envoyer(200, open(local, "rb").read(), "application/octet-stream",
                                      {"ETag": self._etag(local)})
+            if suite == "/LockedByUser":                 # qui a le fichier ouvert (co-édition)
+                return self._envoyer(200, {"Title": "Collègue Martin"} if local in type(self).verrouilles
+                                     else {"odata.null": True})
             if suite == "" and "ETag" in q:
                 qui = type(self).extraits.get(local)
                 return self._envoyer(200, {"ETag": self._etag(local), "CheckOutType": 0 if qui else 2,
@@ -431,8 +434,104 @@ def test_fichier_verrouille_rien_ecrit(source_api, racine, serveur):
     avant = open(fichier, "rb").read()
     faux.verrouilles.add(fichier)
     bilan = mettre_a_jour({"13001": ["13001_2"]}, ReglesConfig.defaut(), source_api.racine, source=source_api)
-    assert "verrouill" in bilan.resultats[0].message and "13001_2" in bilan.echecs
+    message = bilan.resultats[0].message
+    assert message.startswith("classeur verrouillé par Collègue Martin — fichier ouvert sur SharePoint")
+    assert "13001_2" in bilan.echecs and "Collègue Martin" in bilan.echecs["13001_2"]
     assert open(fichier, "rb").read() == avant
+
+
+def test_verrou_par_sans_verrou(client):
+    assert client.verrou_par(f"{DOSSIER}/Dep13/13001/audit_13001.xlsx") == ""
+    assert client.verrou_par(f"{DOSSIER}/Dep13/13001/absent.xlsx") == ""     # ne lève jamais
+
+
+def test_fichier_ouvert_retente_puis_ecrit(source_api, racine, serveur):
+    """Le collègue ferme le fichier pendant l'attente : le nouvel essai l'écrit."""
+    srv, faux = serveur
+    fichier = os.path.join(racine, "Dep13", "13001", "audit_13001.xlsx")
+    faux.verrouilles.add(fichier)
+    attentes, etapes = [], []
+
+    def attendre(delai):
+        attentes.append(delai)
+        faux.verrouilles.discard(fichier)
+
+    bilan = mettre_a_jour({"13001": ["13001_2"]}, ReglesConfig.defaut(), source_api.racine, source=source_api,
+                          reprises_verrou=3, delai_reprise_s=30, attendre=attendre,
+                          on_etape=lambda c, m: etapes.append(m))
+    assert attentes == [30] and bilan.echecs == {} and bilan.nb_communes_ok == 1
+    assert any("nouvel essai 1/3 dans 30 s" in e for e in etapes)
+
+
+def test_fichier_ouvert_retente_puis_abandonne(source_api, racine, serveur):
+    srv, faux = serveur
+    faux.verrouilles.add(os.path.join(racine, "Dep13", "13001", "audit_13001.xlsx"))
+    attentes = []
+    bilan = mettre_a_jour({"13001": ["13001_2"], "2A004": ["2A004_1"]}, ReglesConfig.defaut(),
+                          source_api.racine, source=source_api, reprises_verrou=2, delai_reprise_s=5,
+                          attendre=attentes.append)
+    assert attentes == [5, 5] and set(bilan.echecs) == {"13001_2"}
+    assert [r.commune for r in bilan.resultats] == ["13001", "2A004"]     # ordre conservé
+
+
+def test_arret_pendant_l_attente(source_api, racine, serveur):
+    srv, faux = serveur
+    faux.verrouilles.add(os.path.join(racine, "Dep13", "13001", "audit_13001.xlsx"))
+    arret = []
+    bilan = mettre_a_jour({"13001": ["13001_2"]}, ReglesConfig.defaut(), source_api.racine, source=source_api,
+                          reprises_verrou=5, delai_reprise_s=60, attendre=lambda d: arret.append(d),
+                          doit_arreter=lambda: bool(arret))
+    assert arret == [60] and "13001_2" in bilan.echecs
+
+
+def test_excel_refuse_l_adresse_repli_api(source_api, racine, serveur):
+    """Mode lien SharePoint : Excel n'ouvre pas l'adresse (compte Office, poste…) → l'API écrit le fichier fermé."""
+    from tests.test_ecriture import _Excel
+
+    class _ExcelSansAcces(_Excel):
+        def appliquer_regles(self, fichier, config, ids, on_etape=None):
+            raise OSError("Microsoft Excel cannot access the file")
+
+    bilan = mettre_a_jour({"13001": ["13001_2"]}, ReglesConfig.defaut(), source_api.racine, source=source_api,
+                          via_excel=True, session_factory=lambda: _ExcelSansAcces([]))
+    assert bilan.echecs == {} and bilan.via_api and bilan.nb_communes_ok == 1
+
+
+def test_excel_refuse_et_fichier_ouvert_raison_complete(source_api, racine, serveur):
+    from tests.test_ecriture import _Excel
+    srv, faux = serveur
+    faux.verrouilles.add(os.path.join(racine, "Dep13", "13001", "audit_13001.xlsx"))
+
+    class _ExcelSansAcces(_Excel):
+        def appliquer_regles(self, fichier, config, ids, on_etape=None):
+            raise OSError("Microsoft Excel cannot access the file")
+
+    bilan = mettre_a_jour({"13001": ["13001_2"]}, ReglesConfig.defaut(), source_api.racine, source=source_api,
+                          via_excel=True, session_factory=lambda: _ExcelSansAcces([]))
+    raison = bilan.echecs["13001_2"]
+    assert "Collègue Martin" in raison and "Excel n'a pas pu ouvrir ce fichier : Microsoft Excel cannot access" in raison
+
+
+def test_diagnostic_api(source_api, racine, serveur):
+    from avf.services.diagnostic_ecriture import KO, OK, diagnostiquer_ecriture
+    srv, faux = serveur
+    faux.verrouilles.add(os.path.join(racine, "Dep13", "13001", "audit_13001.xlsx"))
+    lignes = diagnostiquer_ecriture(source_api, "13001", excel_present=lambda: False)
+    textes = "\n".join(t for _, t in lignes)
+    assert (KO, "fichier ouvert en ce moment par Collègue Martin") in lignes
+    assert any(e == OK and "téléchargement autorisé" in t for e, t in lignes)
+    assert "Excel / pywin32 introuvables" in textes
+    assert lignes[-1][1].startswith("CONCLUSION : seuls les fichiers FERMÉS")
+    assert not any(a.startswith("POST") for a in faux.appels)                  # rien écrit
+
+
+def test_diagnostic_api_acces_conditionnel(source_api, serveur):
+    from avf.services.diagnostic_ecriture import diagnostiquer_ecriture
+    srv, faux = serveur
+    faux.telechargement_interdit = True
+    lignes = diagnostiquer_ecriture(source_api, "13001", excel_present=lambda: False)
+    assert any("accès conditionnel" in t for _, t in lignes)
+    assert lignes[-1][1].startswith("CONCLUSION : aucune voie")
 
 
 def test_fichier_extrait_rien_ecrit(source_api, racine, serveur):

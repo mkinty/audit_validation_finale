@@ -210,6 +210,16 @@ class ClientSharePoint:
         return {"ETag": donnees.get("ETag", ""), "CheckOutType": donnees.get("CheckOutType", 2),
                 "CheckedOutBy": qui}
 
+    def verrou_par(self, chemin_fichier: str) -> str:
+        """Nom de la personne qui a le fichier ouvert (verrou de co-édition / d'édition),
+        ``""`` si SharePoint ne le dit pas. Ne lève jamais : sert à expliquer un refus."""
+        try:
+            donnees = self._json(self._api(chemin_fichier, "GetFileByServerRelativePath",
+                                           "/LockedByUser?$select=Title,Email"))
+        except Exception:  # noqa: BLE001
+            return ""
+        return str(donnees.get("Title") or donnees.get("Email") or "").strip()
+
     def jeton(self, chemin_serveur: str) -> str:
         """Jeton de formulaire (« request digest ») exigé par SharePoint pour écrire."""
         corps, _ = self._echange(f"{site_de(chemin_serveur)}/_api/contextinfo", methode="POST", donnees=b"")

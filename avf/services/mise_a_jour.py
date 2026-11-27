@@ -131,6 +131,9 @@ def mettre_a_jour(
     doit_arreter: Callable[[], bool] | None = None,
     source: SourceAudit | None = None,
     colonne_id: str | None = None,
+    reprises_verrou: int = 0,
+    delai_reprise_s: float = 60,
+    attendre: Callable[[float], None] | None = None,
 ) -> BilanMiseAJour:
     """Applique les règles aux ID erreur des communes, comme complete_excel_files.
 
@@ -148,6 +151,9 @@ def mettre_a_jour(
             unique écrit la commune en cours.
         doit_arreter: consulté avant chaque commune (bouton « Arrêter ») ; une
             commune commencée va toujours à son terme.
+        reprises_verrou: nouveaux essais des fichiers refusés parce qu'ouverts par
+            quelqu'un (hors fichier extrait), espacés de ``delai_reprise_s`` secondes ;
+            ``doit_arreter`` interrompt l'attente.
         colonne_id: colonne qui identifie les lignes de ``groupes`` (l'**ID imm** pour un
             rapport d'audit), à la place de celle des règles.
         source: source de l'audit. En **SharePoint**, l'écriture passe
@@ -218,15 +224,30 @@ def mettre_a_jour(
                 return acces.lisible(adresse) if adresse else None
 
     with pile, contexte as session:
-        resultats = traiter_communes(
-            groupes, regles, racine, simuler=simuler,
-            on_progression=on_progression, on_resultat=on_resultat, on_etape=on_etape,
-            session_excel=session if not simuler else None,
-            paralleles=paralleles, doit_arreter=doit_arreter,
-            prereperage=not (source is not None and source.mode in (EXCEL, URL, API)),
-            localiser=localiser,
-            conflits=acces.conflits if acces is not None else None,
-        )
+        def traiter(lot):
+            return traiter_communes(
+                lot, regles, racine, simuler=simuler,
+                on_progression=on_progression, on_resultat=on_resultat, on_etape=on_etape,
+                session_excel=session if not simuler else None,
+                paralleles=paralleles, doit_arreter=doit_arreter,
+                prereperage=not (source is not None and source.mode in (EXCEL, URL, API)),
+                localiser=localiser,
+                conflits=acces.conflits if acces is not None else None,
+            )
+
+        resultats = traiter(groupes)
+        for tour in range(1, (0 if simuler else reprises_verrou) + 1):
+            ouvertes = [r.commune for r in resultats if _ouvert_ailleurs(r)]
+            if not ouvertes or (doit_arreter and doit_arreter()):
+                break
+            if on_etape is not None:
+                on_etape("⏳", f"{len(ouvertes)} fichier(s) ouvert(s) par d'autres ({', '.join(ouvertes[:6])}"
+                               f"{' …' if len(ouvertes) > 6 else ''}) : nouvel essai {tour}/{reprises_verrou} "
+                               f"dans {int(delai_reprise_s)} s — « Arrêter » pour ne pas attendre")
+            if not _patienter(delai_reprise_s, doit_arreter, attendre):
+                break
+            nouveaux = {r.commune: r for r in traiter({c: groupes[c] for c in ouvertes})}
+            resultats = [nouveaux.get(r.commune, r) for r in resultats]
 
     echecs, reussis = attente.calculer_echecs_et_reussites(groupes, resultats)
     if colonne_id:   # message du moteur écrit pour les ID erreur : préciser la colonne réelle
@@ -247,6 +268,26 @@ def mettre_a_jour(
 
 class EcritureSharePointImpossible(RuntimeError):
     """Source SharePoint : la mise à jour exige Excel (co-édition)."""
+
+
+def _ouvert_ailleurs(resultat) -> bool:
+    """Commune refusée parce que son fichier est ouvert (à retenter), pas extrait ni en erreur."""
+    message = resultat.message or ""
+    return (resultat.statut is Statut.ERREUR and message.startswith("classeur verrouillé")
+            and "EXTRAIT" not in message)
+
+
+def _patienter(delai_s: float, doit_arreter, attendre=None) -> bool:
+    """Attend ``delai_s`` secondes ; ``False`` si l'arrêt est demandé entre-temps."""
+    if attendre is not None:
+        attendre(delai_s)
+        return not (doit_arreter and doit_arreter())
+    fin = time.monotonic() + delai_s
+    while time.monotonic() < fin:
+        if doit_arreter and doit_arreter():
+            return False
+        time.sleep(min(0.5, max(0.0, fin - time.monotonic())))
+    return True
 
 
 def _synchronise(racine: str) -> bool:

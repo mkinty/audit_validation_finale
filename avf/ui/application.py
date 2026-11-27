@@ -240,6 +240,8 @@ class Application(tk.Tk):
         haut.pack(fill="x")
         bouton(haut, "⚙️ Réglage des valeurs (règles)", self._ouvrir_regles).pack(side="left")
         bouton(haut, "↺ Valeurs par défaut", self._regles_par_defaut, "discret").pack(side="left", padx=6)
+        self.btn_diag = bouton(haut, "🩺 Diagnostic écriture", self._diagnostiquer_ecriture, "discret")
+        self.btn_diag.pack(side="left", padx=6)
         self.btn_maj = bouton(haut, "🛠️  Mettre à jour les ID non valides",
                               lambda: self._lancer_mise_a_jour(None), "alerte", padx=16, pady=6)
         self.btn_maj.pack(side="right")
@@ -921,6 +923,37 @@ class Application(tk.Tk):
                                fg=Couleurs.BLEU_CLAIR if regles.actives else Couleurs.AVERTISSEMENT)
 
     # ══ Mise à jour ═══════════════════════════════════════════════
+    def _diagnostiquer_ecriture(self) -> None:
+        """Pourquoi un fichier ouvert n'est pas mis à jour : chaque voie d'écriture essayée sans rien écrire."""
+        if self.occupe:
+            return
+        source = self._source()
+        if source is None:
+            messagebox.showinfo("Diagnostic écriture", "Choisissez d'abord la source (étape 1).", parent=self)
+            return
+        proposee = ""
+        if self.rapport is not None:
+            proposee = next((c.commune for c in self.rapport.communes if c.ids_non_valides), "") or \
+                next((c.commune for c in self.rapport.communes), "")
+        from tkinter import simpledialog
+        commune = simpledialog.askstring(
+            "Diagnostic écriture",
+            "Code INSEE de la commune dont le fichier est ouvert par quelqu'un\n"
+            "(lecture seule : rien n'est écrit) :", initialvalue=proposee, parent=self)
+        if not commune or not commune.strip():
+            return
+        from ..services.diagnostic_ecriture import KO, OK, diagnostiquer_ecriture
+        self.journaliser(SEPARATEUR, Couleurs.SEPARATEUR)
+
+        def fin(lignes) -> None:
+            couleurs = {OK: Couleurs.SUCCES, KO: Couleurs.AVERTISSEMENT}
+            for etat, texte in lignes:
+                icone = {OK: "✅", KO: "⚠"}.get(etat, "·")
+                self.journaliser(f"   {icone} {texte}", couleurs.get(etat, Couleurs.TEXTE_SECONDAIRE))
+
+        self._en_fond(f"🩺 Diagnostic de l'écriture — commune {commune.strip().upper()} (rien n'est écrit)…",
+                      lambda: diagnostiquer_ecriture(source, commune), fin)
+
     def _lancer_mise_a_jour(self, communes: list[str] | None = None) -> None:
         if self.occupe:
             return
@@ -1000,6 +1033,8 @@ class Application(tk.Tk):
                 on_resultat=lambda r: self.journaliser(*_ligne_maj(r)),
                 paralleles=self.params.paralleles,
                 doit_arreter=self._arret.is_set,
+                reprises_verrou=self.params.reprises_verrou,
+                delai_reprise_s=self.params.delai_reprise_s,
             )
         except EcritureSharePointImpossible as exc:
             self.journaliser(f"❌ {exc} — aucune écriture faite.", Couleurs.ERREUR)
@@ -1112,6 +1147,7 @@ class Application(tk.Tk):
         for b in (self.btn_export, self.btn_export_xlsx, self.btn_export_csv):
             b.config(state=etat(a_rapport))
         self.btn_maj.config(state=etat(a_rapport and bool(self.rapport and self.rapport.nb_ids_non_valides)))
+        self.btn_diag.config(state=etat(racine_ok))
         if a_rapport:
             self.btn_maj.config(text=f"🛠️  Mettre à jour les {p.nombre(self.rapport.nb_ids_non_valides)} "
                                      "ID non valides")

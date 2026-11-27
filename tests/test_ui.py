@@ -861,3 +861,19 @@ def test_dialogue_colonnes_id_imm_et_id_erreur(app):
     d._valider()
     colonnes, colonne_id, _ = d.resultat
     assert (colonnes.id_imm, colonnes.id_erreur, colonne_id) == ("N° immeuble", "Erreur", "N° immeuble")
+
+
+def test_diagnostic_ecriture_au_journal(app, racine, monkeypatch):
+    """« 🩺 Diagnostic écriture » : chaque voie essayée sans rien écrire, conclusion au journal."""
+    from tkinter import simpledialog
+    from avf.services import diagnostic_ecriture
+    app.var_racine.set(racine)
+    monkeypatch.setattr(simpledialog, "askstring", lambda *a, **k: "13001")
+    monkeypatch.setattr(diagnostic_ecriture, "excel_disponible", lambda: False)
+    avant = open(os.path.join(racine, "Dep13", "13001", "audit_13001.xlsx"), "rb").read()
+    app._diagnostiquer_ecriture()
+    attendre(app)
+    journal = app.txt_log.get("1.0", tk.END)
+    assert "🩺 Diagnostic de l'écriture — commune 13001" in journal
+    assert "Excel / pywin32 introuvables" in journal and "CONCLUSION" in journal
+    assert open(os.path.join(racine, "Dep13", "13001", "audit_13001.xlsx"), "rb").read() == avant

@@ -650,7 +650,9 @@ class SessionApi:
                 dire("↻ fichier enregistré par quelqu'un d'autre entre-temps — nouvelle lecture")
                 continue
             except rest.FichierVerrouille as exc:
-                bilan.verrouille = str(exc)
+                qui = self.client.verrou_par(chemin)
+                bilan.verrouille = (f"{qui or 'un autre utilisateur'} — fichier ouvert sur SharePoint, "
+                                    f"SharePoint refuse de le remplacer pendant qu'il est ouvert ({exc})")
                 bilan.enregistre = False
                 bilan.comptes = {k: 0 for k in bilan.comptes}
                 dire(f"⚠ {exc} — rien écrit")
