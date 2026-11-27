@@ -57,6 +57,25 @@ def test_commune_illisible_ses_ids_sont_introuvables(racine):
     assert r.ids_introuvables() == ["13003_1"]
 
 
+def test_ids_non_audites_en_texte(racine):
+    from avf.views import ids_ignores as ign
+    r = auditer_communes(["13001", "13003"], racine, ids={"13001": ["13001_2", "13001_99"], "13003": ["13003_1"]})
+    ignores = ign.IdsIgnores("ID erreur", {"99999": ["99999_1", "99999_2"]}, ["13002"])
+    assert ign.nombre(ignores, r) == 5 and ign.nombre(None, None) == 0
+    texte = ign.generer_texte(ignores, r, "R:/racine")
+    lignes = texte.split("\r\n")
+    assert lignes[0] == "ID erreur non audités — 5 au total" and "Racine : R:/racine" in lignes
+    assert "99999_1\t99999\tdossier Dep99/99999 introuvable" in lignes
+    assert "13002\t13002\tpas de numéro" in lignes
+    assert any(l.startswith("13003_1\t13003\t") for l in lignes)              # fichier illisible
+    assert any(l.startswith("13001_99\t13001\t") for l in lignes)             # absent du fichier
+    assert not any(l.startswith("13001_2") for l in lignes)
+    # Recollé dans la saisie, il redonne exactement les ID (les titres n'en contiennent aucun)
+    from avf.services.detection import groupes_depuis_texte
+    assert sorted(i for v in groupes_depuis_texte(texte).values() for i in v) == [
+        "13001_99", "13003_1", "99999_1", "99999_2"]
+
+
 def test_audit_parallele_par_ids(racine):
     seq = auditer_communes(["13001", "2A004"], racine, ids=IDS)
     par = auditer_communes(["13001", "2A004"], racine, ids=IDS, paralleles=4)
@@ -81,7 +100,7 @@ def test_perimetre_dans_le_resume_et_les_rapports(racine, tmp_path):
     assert "Audit limité à 4 ID erreur saisi(s)" in generer_html(r)
     lignes = list(csv.reader(io.StringIO(generer_csv(r)), delimiter=";"))
     introuvable = next(l for l in lignes if l[3] == "13001_99")      # colonne ID erreur
-    assert introuvable[2] == "" and introuvable[5] == "ID introuvable" and introuvable[10] == "absent du fichier audit"
+    assert introuvable[2] == "" and introuvable[5] == "ID introuvable" and introuvable[10] == "absent des 6 ligne(s) du fichier (5 ID erreur)"
     wb = load_workbook(exporter_xlsx(r, str(tmp_path / "r.xlsx")))
     synthese = {l[0]: l[1] for l in wb["Synthèse"].iter_rows(values_only=True) if l and l[0]}
     assert synthese["Périmètre"].startswith("Audit limité à 4 ID erreur")
@@ -144,3 +163,49 @@ def test_id_imm_au_prefixe_d_une_autre_commune(tmp_path):
     r = auditer_communes(["38074"], racine, ids={"38074": ["ID-3803300000FS"]}, type_ids="id_imm")
     assert r.commune("38074").ids_non_valides == ["ID-3803300000FS"]
     assert any("au code d'une autre commune" in a for a in r.commune("38074").avertissements)
+
+
+def test_diagnostic_des_id_imm_introuvables(tmp_path):
+    """Chaque ID imm introuvable reçoit une précision utile à la recherche (rapport, CSV, .txt)."""
+    from avf.views import ids_ignores as ign
+    racine = str(tmp_path)
+    ecrire_audit(f"{racine}/Dep38/38001/audit_38001.xlsx", [
+        ["38001_1", "a", None, None, None, None, "ID-3800100000AB"],
+        ["38001_2", "a", None, None, None, None, "ID-3800100000AC"],
+        ["ID-3800100000ZZ", "a", None, None, None, None, "ID-3800100000AD"],   # ID imm dans « ID erreur »
+    ])
+    ecrire_audit(f"{racine}/Dep38/38002/audit_38002.xlsx", [
+        ["38002_1", "a", None, None, None, None, "ID-3800100000QQ"],          # rangé dans 38002
+        ["38002_2", "a", None, None, None, None, "ID-3800200000AA"],
+    ])
+    saisis = {"38001": ["ID-3800100000AX",        # un caractère de différence avec …AB / …AC
+                        "ID-3800100000ZZ",        # dans la colonne ID erreur
+                        "ID-3800100000QQ",        # dans le fichier de 38002
+                        "ID-38001000",            # tronqué
+                        "ID-3800100009KK"],       # absent
+              "38002": ["ID-3800200000AA"]}
+    for paralleles in (1, 4):
+        r = auditer_communes(["38001", "38002"], racine, ids=saisis, type_ids="id_imm", paralleles=paralleles)
+        c = r.commune("38001")
+        d = c.diagnostic_introuvables
+        assert d["ID-3800100000AX"].startswith("ID imm proche dans le fichier : ID-3800100000AB (ligne 2)")
+        assert "faute de frappe" in d["ID-3800100000AX"]
+        assert d["ID-3800100000ZZ"] == "présent dans la colonne « ID erreur » (ligne 4), pas dans « ID imm »"
+        assert d["ID-3800100000QQ"].startswith("trouvé dans le fichier d'une autre commune : commune 38002 (ligne 2)")
+        assert d["ID-38001000"].startswith("longueur inhabituelle : 11 caractères, 15 pour les ID imm")
+        assert d["ID-3800100009KK"] == "absent des 3 ligne(s) du fichier (3 ID imm)"
+        assert all(not x.index_ids for x in r.communes)            # mémoire libérée après l'audit
+    assert p.causes_introuvables(r) == (
+        "🔬 5 ID introuvable(s) — 1 dans le fichier d'une autre commune, 1 dans l'autre colonne d'identifiant, "
+        "1 faute de frappe probable (ID proche), 1 longueur inhabituelle (mal saisi ou tronqué), "
+        "1 absents du fichier de leur commune · détail par ID : « 📝 ID non audités (.txt) »")
+    texte = ign.generer_texte(None, r)
+    assert "ID-3800100000QQ\t38001\ttrouvé dans le fichier d'une autre commune" in texte
+    lignes = list(csv.reader(io.StringIO(generer_csv(r)), delimiter=";"))
+    assert "faute de frappe" in next(l for l in lignes if l[2] == "ID-3800100000AX")[10]
+
+
+def test_a_un_caractere():
+    from avf.services.audit import _a_un_caractere
+    assert _a_un_caractere("ABC", "ABD") and _a_un_caractere("ABC", "AC") and _a_un_caractere("AC", "ABC")
+    assert not _a_un_caractere("ABC", "ABC") and not _a_un_caractere("ABC", "AXY") and not _a_un_caractere("A", "ABC")

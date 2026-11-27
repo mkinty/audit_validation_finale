@@ -106,6 +106,7 @@ def auditer_communes(
             if on_resultat is not None:
                 on_resultat(resultat)
 
+    _chercher_dans_les_autres_communes(rapport.communes)
     rapport.duree = time.perf_counter() - depart
     _progresser(on_progression, len(rapport.communes), total, "Terminé")
     return rapport
@@ -183,6 +184,13 @@ def auditer_commune(
         lignes = [l for l in lignes if cle(l) in voulus]
         trouves = {cle(l) for l in lignes}
         resultat.ids_introuvables = [i for i in resultat.ids_demandes if i not in trouves]
+        resultat.index_ids = {}             # tous les ID du fichier : recherche entre communes
+        for l in lecture.lignes:
+            resultat.index_ids.setdefault(cle(l), l.ligne)
+        resultat.index_ids.pop("", None)
+        if resultat.ids_introuvables:
+            resultat.diagnostic_introuvables = diagnostiquer_introuvables(
+                resultat.ids_introuvables, lecture.lignes, type_ids, colonnes, resultat.index_ids)
         if resultat.ids_introuvables:
             nature = colonnes.id_imm if type_ids == PAR_ID_IMM else colonnes.id_erreur
             resultat.avertissements.append(
@@ -201,6 +209,77 @@ def auditer_commune(
         f"{resultat.nb_lignes_non_valides} non valide(s) ({resultat.nb_ids_non_valides} ID erreur)"
     )
     return resultat
+
+
+def diagnostiquer_introuvables(introuvables: Sequence[str], lignes_fichier: Sequence, type_ids: str,
+                               colonnes: ColonnesAudit, index: Mapping[str, int] | None = None) -> dict[str, str]:
+    """Pourquoi chaque ID saisi est absent du fichier : ``{id: précision}``.
+
+    Dans l'ordre : l'ID est dans l'autre colonne d'identifiant ; (ID imm seulement) un ID
+    du fichier n'en diffère que d'un caractère (faute de frappe probable), ou sa longueur
+    est inhabituelle pour ce fichier ; sinon il est simplement absent des N lignes lues.
+    La recherche dans les fichiers des autres communes est faite à la fin de l'audit.
+    """
+    par_imm = type_ids == PAR_ID_IMM
+    nom = colonnes.id_imm if par_imm else colonnes.id_erreur
+    autre_nom = colonnes.id_erreur if par_imm else colonnes.id_imm
+    if index is None:
+        index = {}
+        for l in lignes_fichier:
+            index.setdefault(normaliser_id(l.id_imm if par_imm else l.id_erreur), l.ligne)
+        index.pop("", None)
+    autre: dict[str, int] = {}
+    for l in lignes_fichier:
+        autre.setdefault(normaliser_id(l.id_erreur if par_imm else l.id_imm), l.ligne)
+    par_longueur: dict[int, list[str]] = {}
+    for i in index:
+        par_longueur.setdefault(len(i), []).append(i)
+    longueur_habituelle = max(par_longueur, key=lambda n: len(par_longueur[n])) if par_longueur else 0
+
+    diagnostics = {}
+    for i in introuvables:
+        if i in autre:
+            diagnostics[i] = f"présent dans la colonne « {autre_nom} » (ligne {autre[i]}), pas dans « {nom} »"
+            continue
+        proches = [c for n in (len(i) - 1, len(i), len(i) + 1) for c in par_longueur.get(n, ())
+                   if _a_un_caractere(i, c)] if par_imm else []     # ID erreur : 13001_9 / 13001_99 légitimes
+        if proches:
+            diagnostics[i] = (f"{nom} proche dans le fichier : "
+                              + ", ".join(f"{c} (ligne {index[c]})" for c in proches[:3])
+                              + " — faute de frappe ?")
+        elif par_imm and longueur_habituelle and len(i) != longueur_habituelle and len(par_longueur.get(len(i), ())) == 0:
+            diagnostics[i] = (f"longueur inhabituelle : {len(i)} caractères, {longueur_habituelle} pour les {nom} "
+                              f"de ce fichier — ID mal saisi ou tronqué ? (absent des {len(lignes_fichier)} lignes)")
+        else:
+            diagnostics[i] = f"absent des {len(lignes_fichier)} ligne(s) du fichier ({len(index)} {nom})"
+    return diagnostics
+
+
+def _a_un_caractere(a: str, b: str) -> bool:
+    """``a`` et ``b`` diffèrent d'exactement un caractère (remplacé, ajouté ou retiré)."""
+    if a == b or abs(len(a) - len(b)) > 1:
+        return False
+    if len(a) == len(b):
+        return sum(x != y for x, y in zip(a, b)) == 1
+    court, long_ = (a, b) if len(a) < len(b) else (b, a)
+    k = 0
+    while k < len(court) and court[k] == long_[k]:
+        k += 1
+    return court[k:] == long_[k + 1:]
+
+
+def _chercher_dans_les_autres_communes(communes: Sequence[AuditCommune]) -> None:
+    """Un ID introuvable dans le fichier de sa commune est-il dans le fichier d'une autre ?"""
+    avec_index = [c for c in communes if c.index_ids]
+    for c in avec_index:
+        for i in c.ids_introuvables:
+            ailleurs = [(d.commune, d.index_ids[i]) for d in avec_index if d is not c and i in d.index_ids]
+            if ailleurs:
+                ou = ", ".join(f"commune {code} (ligne {ligne})" for code, ligne in ailleurs[:3])
+                c.diagnostic_introuvables[i] = (f"trouvé dans le fichier d'une autre commune : {ou} — "
+                                                "à saisir/traiter via cette commune")
+    for c in avec_index:            # l'index ne sert qu'à cette recherche : on libère la mémoire
+        c.index_ids = {}
 
 
 def _qualite_identifiants(c: AuditCommune, colonnes: ColonnesAudit) -> list[str]:

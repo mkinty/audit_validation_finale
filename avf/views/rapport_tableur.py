@@ -51,7 +51,7 @@ def lignes_detail(rapport: RapportAudit, categorie: str = TOUTES) -> list[list]:
         for i in c.ids_introuvables:          # audit par ID : ID saisi absent du fichier
             id_imm, id_erreur = (i, "") if c.type_ids == "id_imm" else ("", i)
             lignes.append([f"Dep{c.departement}", c.commune, id_imm, id_erreur, None, "ID introuvable",
-                           "", "", "", "", "absent du fichier audit", c.chemin])
+                           "", "", "", "", c.diagnostic(i), c.chemin])
     return lignes
 
 

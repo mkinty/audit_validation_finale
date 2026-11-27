@@ -53,6 +53,14 @@ def exporter_xlsx(rapport: RapportAudit, chemin: str) -> str:
     return _ecrire(chemin, lambda tmp: generer_xlsx(rapport).save(tmp))
 
 
+def exporter_texte(chemin: str, texte: str) -> str:
+    """Fichier texte UTF-8 avec BOM (lu correctement par le Bloc-notes et Excel)."""
+    def ecrire(tmp: Path) -> None:
+        with open(tmp, "w", encoding="utf-8-sig", newline="") as f:
+            f.write(texte)
+    return _ecrire(chemin, ecrire)
+
+
 def _ecrire(chemin: str, ecrire) -> str:
     cible = Path(chemin).expanduser().resolve()
     cible.parent.mkdir(parents=True, exist_ok=True)

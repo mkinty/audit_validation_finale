@@ -205,7 +205,25 @@ sont auditées puis mises à jour, par leur ID imm. On les colle séparés par d
 - Un ID **absent de son fichier** est signalé : avertissement sur la commune, ligne
   « ID introuvable » dans les exports CSV et Excel, et liste dans le bilan.
 - Sont aussi signalés : un ID dont la commune n'a pas de dossier, et un code INSEE saisi
-  sans numéro (`13002`). Ils sont ignorés.
+  sans numéro (`13002`). Ils sont ignorés. Le message propose de les **exporter en .txt**.
+- **Aucune limite** au nombre d'ID saisis ou chargés : seules la mémoire et la durée de
+  l'audit comptent. Des dizaines de milliers d'ID passent sans problème.
+- `📝 ID non audités (.txt)` (étape 3, et pied de la fenêtre du rapport) exporte **tous**
+  les ID saisis qui n'ont pas été audités, une section par raison : commune sans dossier,
+  code sans numéro, fichier de la commune illisible, ID absent du fichier de sa commune.
+  Une ligne par ID : `ID <tab> commune <tab> précision <tab> fichier`. Le fichier se colle
+  dans Excel, ou dans la saisie des ID pour relancer une recherche (les titres ne
+  contiennent aucun ID).
+- **Diagnostic des ID introuvables.** Pour chaque ID absent du fichier de sa commune, la
+  précision (dans le .txt, les exports CSV/Excel et le résumé « 🔬 » du journal) dit pourquoi :
+  - *trouvé dans le fichier d'une autre commune* (parmi les communes auditées), avec la ligne ;
+  - *présent dans la colonne « ID erreur »* (ou « ID imm »), pas dans la bonne colonne ;
+  - *ID imm proche dans le fichier* : un seul caractère diffère, donc faute de frappe probable ;
+  - *longueur inhabituelle* : ID imm tronqué ou mal saisi ;
+  - sinon *absent des N lignes du fichier*.
+
+  Les deux tests « proche » et « longueur » ne portent que sur les ID imm : pour les ID
+  erreur, `13001_9` et `13001_99` sont tous deux légitimes.
 - Le **périmètre** (« 🎯 Audit limité à N ID erreur saisi(s) — K introuvable(s) ») figure
   sous la liste des communes, dans le journal, la fenêtre du rapport, le HTML et la
   synthèse Excel.
@@ -502,7 +520,8 @@ audit_validation_finale/
 │   ├── views/                   #   rendu
 │   │   ├── presentation.py      #     formats partagés (nombres, %, états)
 │   │   ├── rapport_html.py      #     rapport HTML autonome
-│   │   └── rapport_tableur.py   #     classeur Excel (4 onglets) et CSV
+│   │   ├── rapport_tableur.py   #     classeur Excel (4 onglets) et CSV
+│   │   └── ids_ignores.py       #     liste .txt des ID saisis non audités
 │   └── ui/                      #   Tkinter
 │       ├── application.py       #     fenêtre principale
 │       ├── fenetre_rapport.py   #     popup du rapport

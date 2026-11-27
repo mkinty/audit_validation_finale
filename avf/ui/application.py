@@ -43,10 +43,13 @@ from ..services import detection, sharepoint, sharepoint_rest
 from ..services.import_liste import COLONNES_ID, COLONNES_ID_IMM, COLONNES_INSEE
 from sna.services.identifiants import grouper_par_commune
 from ..services.audit import auditer_communes
-from ..services.export import FORMATS, exporter, nom_fichier_defaut, ouvrir_dans_navigateur, ouvrir_fichier
+from ..services.export import (
+    FORMATS, exporter, exporter_texte, nom_fichier_defaut, ouvrir_dans_navigateur, ouvrir_fichier,
+)
 from ..services.mise_a_jour import (
     EcritureSharePointImpossible, groupes_depuis_rapport, mettre_a_jour, preparer_regles,
 )
+from ..views import ids_ignores as ign
 from ..views import presentation as p
 from .composants import (
     DialogueColonnes, DialogueSaisie, ZoneDefilante, bouton, carte, case, champ, configurer_styles,
@@ -84,6 +87,7 @@ class Application(tk.Tk):
         self._source_sp: SourceAudit | None = None   # accès SharePoint établi
         self.ids_cibles: dict[str, list[str]] = {}    # audit restreint à ces ID ({} : communes entières)
         self.type_cibles = self.params.type_ids       # PAR_ID_ERREUR ou PAR_ID_IMM
+        self.ids_ignores: ign.IdsIgnores | None = None  # ID écartés à la saisie (export .txt)
         self.var_simulation = tk.BooleanVar(value=False)
         self.var_date_du_jour = tk.BooleanVar(value=self.params.date_du_jour)
         self.var_excel = tk.BooleanVar(value=self.params.ecrire_via_excel and self._excel)
@@ -227,6 +231,8 @@ class Application(tk.Tk):
         self.btn_export_xlsx.pack(side="left", padx=(6, 0))
         self.btn_export_csv = bouton(ligne, "📑 CSV", lambda: self._exporter("csv"))
         self.btn_export_csv.pack(side="left", padx=6)
+        self.btn_export_txt = bouton(ligne, "📝 ID non audités (.txt)", self._exporter_ids_ignores)
+        self.btn_export_txt.pack(side="left")
         bouton(ligne, "⚙️ Colonnes auditées", self._configurer_colonnes, "discret").pack(side="right")
         self.lbl_bilan = tk.Label(c, text="", bg=Couleurs.FOND_CARTE, fg=Couleurs.TEXTE_SECONDAIRE,
                                   font=Polices.LABEL, justify="left", anchor="w")
@@ -602,15 +608,22 @@ class Application(tk.Tk):
 
         def fin(saisie) -> None:
             problemes = []
+            ignores = ign.IdsIgnores(nom, dict(saisie.absents), list(saisie.codes_sans_id))
+            self.ids_ignores = ignores if ignores.nombre else None
             if saisie.absents:
                 ids = [i for v in saisie.absents.values() for i in v]
                 problemes.append(f"{len(saisie.absents)} commune(s) sans dossier <racine>/Dep<XX>/<commune> — "
                                  f"leurs {len(ids)} {nom} sont ignorés :\n" + _apercu(list(saisie.absents)))
+                self.journaliser(f"⚠ {len(ids)} {nom} ignoré(s) : {len(saisie.absents)} commune(s) sans dossier "
+                                 "— « 📝 ID non audités (.txt) » pour les exporter", Couleurs.AVERTISSEMENT)
             if saisie.codes_sans_id:
                 problemes.append("Codes INSEE saisis sans numéro d'ID (format <insee>_<numéro>) — ignorés :\n"
                                  + _apercu(saisie.codes_sans_id))
             if problemes:
-                messagebox.showwarning(nom, "\n\n".join(problemes), parent=self)
+                if messagebox.askyesno(nom, "\n\n".join(problemes) + f"\n\nExporter ces {ignores.nombre} "
+                                       f"{nom} ignoré(s) dans un fichier texte (.txt) ?", icon="warning",
+                                       parent=self):
+                    self._exporter_ids_ignores(avec_rapport=False)
             if not saisie.groupes:
                 format_ = "ID-58006000005V" if par_imm else "13001_2"
                 messagebox.showinfo(nom, f"Aucun {nom} exploitable (format attendu : {format_}).", parent=self)
@@ -651,6 +664,7 @@ class Application(tk.Tk):
         if not self.ids_cibles and not self.params.ids_cibles:
             return
         self.ids_cibles = {}
+        self.ids_ignores = None
         self.params.ids_cibles = []
         self._sauver()
         self._maj_perimetre()
@@ -807,6 +821,9 @@ class Application(tk.Tk):
         self.journaliser(SEPARATEUR, Couleurs.SEPARATEUR)
         for ligne in p.resume(self.rapport):
             self.journaliser(f"📊 {ligne}", Couleurs.SUCCES)
+        causes = p.causes_introuvables(self.rapport)
+        if causes:
+            self.journaliser(causes, Couleurs.AVERTISSEMENT)
         if interrompu:
             self.journaliser("⏹ Audit arrêté à la demande — rapport partiel", Couleurs.AVERTISSEMENT)
         self._fin_traitement()
@@ -839,6 +856,8 @@ class Application(tk.Tk):
     def _exporter(self, format: str = "html", chemin: str | None = None,
                   ouvrir: bool | None = None) -> str | None:
         """Exporte le rapport en ``html``, ``xlsx`` ou ``csv`` (``chemin`` : sans boîte de dialogue)."""
+        if format == "txt":
+            return self._exporter_ids_ignores(chemin=chemin, ouvrir=ouvrir)
         if self.rapport is None:
             return None
         parent = self.fenetre_rapport if (self.fenetre_rapport and self.fenetre_rapport.winfo_exists()) else self
@@ -868,6 +887,41 @@ class Application(tk.Tk):
                                          f"L'ouvrir dans {application} ?", parent=parent)
         if ouvrir:
             (ouvrir_dans_navigateur if format == "html" else ouvrir_fichier)(chemin)
+        return chemin
+
+    def _exporter_ids_ignores(self, chemin: str | None = None, ouvrir: bool | None = None,
+                              avec_rapport: bool = True) -> str | None:
+        """Fichier .txt des ID saisis non audités : sans dossier, fichier illisible, absents du fichier."""
+        rapport = self.rapport if avec_rapport else None
+        ignores = self.ids_ignores
+        parent = self.fenetre_rapport if (self.fenetre_rapport and self.fenetre_rapport.winfo_exists()) else self
+        total = ign.nombre(ignores, rapport)
+        if not total:
+            messagebox.showinfo("ID non audités", "Aucun ID saisi n'a été écarté : rien à exporter.", parent=parent)
+            return None
+        if chemin is None:
+            dossier = self.params.dossier_export if os.path.isdir(self.params.dossier_export) else self._racine()
+            chemin = filedialog.asksaveasfilename(
+                parent=parent, title="Exporter les ID non audités — texte", defaultextension=".txt",
+                initialdir=dossier if os.path.isdir(dossier) else None,
+                initialfile=ign.nom_fichier_defaut(),
+                filetypes=[("Texte", "*.txt"), ("Tous les fichiers", "*.*")],
+            )
+            if not chemin:
+                return None
+        try:
+            chemin = exporter_texte(chemin, ign.generer_texte(ignores, rapport, self._racine()))
+        except OSError as exc:
+            messagebox.showerror("Export", f"Le fichier n'a pas pu être écrit :\n{exc}", parent=parent)
+            return None
+        self.params.dossier_export = os.path.dirname(chemin)
+        self._sauver()
+        self.journaliser(f"📝 {p.nombre(total)} ID non audité(s) exporté(s) : {chemin}", Couleurs.INFO)
+        if ouvrir is None:
+            ouvrir = messagebox.askyesno("Export", f"{p.nombre(total)} ID enregistré(s) :\n{chemin}\n\n"
+                                         "L'ouvrir ?", parent=parent)
+        if ouvrir:
+            ouvrir_fichier(chemin)
         return chemin
 
     # ══ Colonnes et règles ════════════════════════════════════════
@@ -1146,6 +1200,7 @@ class Application(tk.Tk):
         self.btn_rapport.config(state=etat(a_rapport))
         for b in (self.btn_export, self.btn_export_xlsx, self.btn_export_csv):
             b.config(state=etat(a_rapport))
+        self.btn_export_txt.config(state=etat(bool(ign.nombre(self.ids_ignores, self.rapport))))
         self.btn_maj.config(state=etat(a_rapport and bool(self.rapport and self.rapport.nb_ids_non_valides)))
         self.btn_diag.config(state=etat(racine_ok))
         if a_rapport:

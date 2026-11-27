@@ -119,6 +119,33 @@ def perimetre(rapport: RapportAudit) -> str:
     return texte
 
 
+_CAUSES = (
+    ("trouvé dans le fichier d'une autre commune", "dans le fichier d'une autre commune"),
+    ("présent dans la colonne", "dans l'autre colonne d'identifiant"),
+    ("proche dans le fichier", "faute de frappe probable (ID proche)"),
+    ("longueur inhabituelle", "longueur inhabituelle (mal saisi ou tronqué)"),
+)
+
+
+def causes_introuvables(rapport: RapportAudit) -> str:
+    """« 🔬 257 ID introuvables — 40 dans le fichier d'une autre commune, … » ("" s'il n'y en a pas)."""
+    compte: dict[str, int] = {}
+    total = 0
+    for c in rapport.communes:
+        if not c.lisible:
+            continue
+        for i in c.ids_introuvables:
+            total += 1
+            d = c.diagnostic(i)
+            cause = next((libelle for debut, libelle in _CAUSES if debut in d), "absents du fichier de leur commune")
+            compte[cause] = compte.get(cause, 0) + 1
+    if not total:
+        return ""
+    ordre = [l for _, l in _CAUSES] + ["absents du fichier de leur commune"]
+    detail = ", ".join(f"{nombre(compte[l])} {l}" for l in ordre if l in compte)
+    return (f"🔬 {nombre(total)} ID introuvable(s) — {detail} · détail par ID : « 📝 ID non audités (.txt) »")
+
+
 # ── Journal de la mise à jour : pourquoi un ID imm n'a pas été mis à jour ─
 _CONSEILS = (
     ("absent de la colonne", "vérifiez l'ID imm : faute de frappe, ligne supprimée ou renumérotée, ou "

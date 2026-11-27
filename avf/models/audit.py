@@ -145,6 +145,15 @@ class AuditCommune:
     ids_demandes: list[str] | None = None
     ids_introuvables: list[str] = field(default_factory=list)
     type_ids: str = PAR_ID_ERREUR
+    # Pourquoi chaque ID introuvable l'est (faute de frappe probable, autre colonne,
+    # fichier d'une autre commune…) — cf. ``services.audit``.
+    diagnostic_introuvables: dict[str, str] = field(default_factory=dict)
+    # Pendant l'audit seulement : ID du fichier → n° de ligne (recherche entre communes).
+    index_ids: dict[str, int] = field(default_factory=dict, repr=False, compare=False)
+
+    def diagnostic(self, id_saisi: str) -> str:
+        """Précision sur un ID saisi absent du fichier (« absent du fichier audit » à défaut)."""
+        return self.diagnostic_introuvables.get(id_saisi) or "absent du fichier audit"
 
     # ── Lignes ────────────────────────────────────────────────────
     @property

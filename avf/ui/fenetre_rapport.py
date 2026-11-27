@@ -235,7 +235,8 @@ class FenetreRapport(tk.Toplevel):
         self.btn_maj_tout = bouton(pied, "🛠️ Mettre à jour tous les ID non valides", self._maj_tout, "alerte")
         self.btn_maj_tout.pack(side="right", pady=10)
         if self.on_exporter:
-            for texte, format in (("📑 CSV", "csv"), ("📊 Excel", "xlsx"), ("💾 HTML", "html")):
+            for texte, format in (("📝 ID non audités", "txt"), ("📑 CSV", "csv"), ("📊 Excel", "xlsx"),
+                                  ("💾 HTML", "html")):
                 bouton(pied, texte, lambda f=format: self.on_exporter(f), "secondaire").pack(
                     side="right", padx=(0, 8), pady=10)
             tk.Label(pied, text="Exporter :", bg=Couleurs.FOND_PANNEAU, fg=Couleurs.TEXTE_SECONDAIRE,

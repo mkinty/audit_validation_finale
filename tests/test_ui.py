@@ -560,14 +560,35 @@ def test_audit_par_ids_puis_mise_a_jour_et_reaudit(app, racine, monkeypatch, dia
     assert complet.commune("2A004").ids_non_valides == [imm("2A004", 2)]
 
 
-def test_saisie_ids_signale_les_problemes(app, racine, monkeypatch, dialogues):
+def test_saisie_ids_signale_les_problemes(app, racine, monkeypatch, dialogues, tmp_path):
     app.var_racine.set(racine)
     app._enregistrer_racine()
+    cible = tmp_path / "ignores.txt"
+    ouverts = []
+    monkeypatch.setattr(module_app.filedialog, "asksaveasfilename", lambda **kw: str(cible))
+    monkeypatch.setattr(module_app, "ouvrir_fichier", ouverts.append)
     _saisir_ids(app, monkeypatch, "13001_2 99999_1 13002")
     messages = " ".join(m for _, m in dialogues)
     assert "1 commune(s) sans dossier" in messages and "99999" in messages
     assert "sans numéro" in messages and "13002" in messages
+    assert "Exporter ces 2 ID erreur ignoré(s) dans un fichier texte" in messages
     assert app.liste_com.codes == ["13001"]
+    texte = cible.read_text(encoding="utf-8-sig")
+    assert "99999_1	99999	dossier Dep99/99999 introuvable" in texte
+    assert "13002	13002	pas de numéro" in texte and "13001_2" not in texte
+    assert ouverts == [str(cible.resolve())]
+    assert str(app.btn_export_txt["state"]) == "normal"
+
+    # Après l'audit : les ID absents du fichier s'ajoutent aux ID ignorés à la saisie
+    _saisir_ids(app, monkeypatch, "13001_2 13001_99 99999_1")
+    app._lancer_audit()
+    attendre(app)
+    assert app._exporter("txt", chemin=str(cible), ouvrir=False)
+    texte = cible.read_text(encoding="utf-8-sig")
+    assert "ID erreur non audités — 2 au total" in texte
+    assert "99999_1	99999" in texte and "13001_99	13001	" in texte
+    app._vider_ids()
+    assert app.ids_ignores is None
 
 
 def test_saisie_ids_sans_rien_d_exploitable(app, racine, monkeypatch, dialogues):
